@@ -676,3 +676,142 @@ DO NOT WORK ON
 - UI redesign
 
 Focus only on making the selected largest text box track the real-world text smoothly using ARCore pose updates and a dedicated tracking layer.
+
+Current status:
+
+- Camera works
+- OCR works
+- Largest text box selection works
+
+Problem:
+
+The selected text boundary box is rendered in screen space only.
+
+When the camera moves, the box does not remain attached to the real-world object containing the text.
+
+The box behaves like a UI overlay instead of an AR object.
+
+---
+
+GOAL
+
+Convert the selected text target into a tracked AR world-space target.
+
+The boundary box must remain attached to the real object while the camera moves.
+
+---
+
+REQUIRED IMPLEMENTATION
+
+When OCR selects the largest text box:
+
+1. Compute the center point of the detected text box.
+
+2. Perform an ARCore hit test using the center screen coordinate.
+
+3. If a valid hit result exists:
+   
+   - Plane
+   - Depth point
+   - Feature point
+
+4. Create an ARCore Anchor.
+
+5. Store this anchor as the active text target.
+
+---
+
+TRACKING
+
+Do not store only screen coordinates.
+
+Store:
+
+- Anchor
+- Pose
+- Tracking state
+
+Every AR frame:
+
+1. Get current camera pose.
+2. Get anchor pose.
+3. Transform anchor pose into screen coordinates.
+4. Update boundary box position.
+
+The boundary box should be rendered using the current projected anchor position.
+
+---
+
+RENDERING
+
+The boundary box must be derived from:
+
+Anchor Pose
+→ World Coordinates
+→ Camera Coordinates
+→ Screen Coordinates
+
+Do not reuse stale OCR coordinates after lock.
+
+OCR coordinates are only used to create the initial anchor.
+
+---
+
+LOST TRACKING
+
+If:
+
+anchor.getTrackingState() != TRACKING
+
+temporarily hide the box.
+
+When tracking resumes:
+
+show the box again.
+
+---
+
+UPDATES
+
+OCR should run only occasionally.
+
+AR tracking should run every frame.
+
+The box position should be updated from the anchor pose continuously.
+
+---
+
+SUCCESS CRITERIA
+
+1. Point camera at a sign.
+
+2. Largest text box detected.
+
+3. Anchor created.
+
+4. Move camera left.
+
+Expected:
+Boundary box remains attached to sign.
+
+5. Move camera right.
+
+Expected:
+Boundary box remains attached to sign.
+
+6. Move closer.
+
+Expected:
+Boundary box scales naturally.
+
+7. Move farther.
+
+Expected:
+Boundary box scales naturally.
+
+8. Rotate device.
+
+Expected:
+Boundary box remains attached to the text object.
+
+The boundary box must behave like an AR object in the world, not a screen overlay.
