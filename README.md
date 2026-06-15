@@ -493,3 +493,186 @@ Only call the app "done" when all are true:
 ✅ Feels like a camera feature, not an OCR demo
 
 The biggest milestone is Phase 4. If the box is still glued to the screen after Phase 4, stop everything and fix that before touching translation, fonts, colors, or UI.
+
+
+
+Current status:
+
+Camera works.
+
+OCR works.
+
+Largest text box selection works.
+
+The problem is tracking.
+
+---
+
+CURRENT BUG
+
+A text box is detected correctly.
+
+When the camera moves:
+
+- the box drifts
+- the box freezes
+- the box remains attached to old screen coordinates
+
+The box is not attached to the real-world text.
+
+---
+
+IMPORTANT
+
+Do NOT assume ARCore automatically tracks text.
+
+ARCore tracks camera motion.
+
+ML Kit OCR detects text.
+
+A proper tracking layer must be added between OCR and rendering.
+
+---
+
+REQUIRED ARCHITECTURE
+
+OCR (5–8 FPS)
+↓
+Largest Text Selection
+↓
+Target Lock
+↓
+Tracking Layer (60 FPS)
+↓
+Overlay Rendering
+
+---
+
+TARGET LOCK
+
+When the largest text block is selected:
+
+Store:
+
+- text
+- bounding box
+- center point
+
+This becomes the active target.
+
+---
+
+TRACKING LAYER
+
+Do not wait for OCR every frame.
+
+Between OCR updates:
+
+Track the target position continuously.
+
+Use:
+
+- ARCore camera pose
+- image feature tracking
+- optical flow if needed
+
+The target must move smoothly with the real object.
+
+---
+
+ARCORE USAGE
+
+Use ARCore only for:
+
+- camera pose updates
+- world tracking
+- motion estimation
+
+Use ARCore pose every frame.
+
+When camera pose changes:
+
+Update tracked target position.
+
+Reproject target into screen coordinates.
+
+Redraw overlay.
+
+---
+
+SMOOTHING
+
+Never snap directly.
+
+Use interpolation.
+
+Example:
+
+currentX += (targetX - currentX) * 0.25f
+currentY += (targetY - currentY) * 0.25f
+
+Apply to:
+
+- left
+- top
+- right
+- bottom
+
+This removes jitter.
+
+---
+
+OCR REFRESH
+
+OCR should run only:
+
+5–8 FPS
+
+Tracking should run:
+
+every AR frame
+
+approximately:
+
+30–60 FPS
+
+---
+
+SUCCESS TEST
+
+Point at a sign.
+
+A box appears.
+
+Move camera left.
+
+Expected:
+Box follows sign.
+
+Move camera right.
+
+Expected:
+Box follows sign.
+
+Move closer.
+
+Expected:
+Box scales naturally.
+
+Move away.
+
+Expected:
+Box scales naturally.
+
+The box must never remain attached to a fixed screen position.
+
+---
+
+DO NOT WORK ON
+
+- translation
+- language detection
+- text replacement
+- UI redesign
+
+Focus only on making the selected largest text box track the real-world text smoothly using ARCore pose updates and a dedicated tracking layer.
