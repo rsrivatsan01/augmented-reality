@@ -494,68 +494,34 @@ Only call the app "done" when all are true:
 
 The biggest milestone is Phase 4. If the box is still glued to the screen after Phase 4, stop everything and fix that before touching translation, fonts, colors, or UI.
 
-Current implementation is incorrect.
+Do not modify code.
 
-The detected text boundary box is being treated as a 2D screen overlay.
+Only inspect the project and answer.
 
-I want a true ARCore world-space implementation.
+1. What exact RectF is currently being drawn for the boundary box?
 
-Do not modify OCR.
+2. Which class draws the boundary box?
 
-Do not modify translation.
+3. Which method draws the boundary box?
 
-Do not modify UI.
-
-Focus only on AR tracking.
-
-Requirements:
-
-1. When the largest text box is detected:
+4. Is the box rendered from:
    
-   - Compute its center.
-   - Perform ARCore hit testing.
-   - Find the best valid hit result.
+   A) OCR bounding box coordinates
 
-2. Create ARCore anchors.
+or
 
-3. Do NOT continue rendering from OCR coordinates.
+B) ARCore anchor projection coordinates
 
-4. Store anchor information.
+5. Is frame.hitTest() ever called?
 
-5. Every AR frame:
-   
-   - Read anchor pose.
-   - Convert world coordinates to screen coordinates.
-   - Update boundary box position.
+6. Is createAnchor() ever called?
 
-6. Hide boundary box when anchor tracking is lost.
+7. Is anchor.getPose() ever called every frame?
 
-7. Resume when tracking returns.
+8. Is projectWorldToScreen() used anywhere?
 
-Advanced requirement:
+9. Is the renderer receiving updated anchor positions every frame?
 
-Instead of a single anchor:
+10. Is the overlay still using OCR coordinates after an anchor has been created?
 
-Create four anchors corresponding to:
-
-- Top Left
-- Top Right
-- Bottom Left
-- Bottom Right
-
-Project all four anchor positions every frame.
-
-Reconstruct the boundary box from these projected points.
-
-This allows the box to remain attached to the real-world text region instead of a single point.
-
-Success criteria:
-
-- Detect text.
-- Create anchors.
-- Move camera.
-- Boundary box remains attached to text.
-- Boundary box updates from anchor poses.
-- No rendering from stale OCR coordinates.
-- No screen-locked behavior.
-
+Answer with exact filenames and methods.
