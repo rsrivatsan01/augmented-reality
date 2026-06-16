@@ -815,3 +815,154 @@ Expected:
 Boundary box remains attached to the text object.
 
 The boundary box must behave like an AR object in the world, not a screen overlay.
+
+
+DO NOT MODIFY ANY CODE YET.
+
+FIRST PERFORM A COMPLETE TRACKING AUDIT OF THE PROJECT.
+
+Current status:
+
+- Camera preview works.
+- OCR works.
+- Largest text box detection works.
+- Bounding boxes appear.
+- Bounding boxes do NOT stay attached to the real-world text.
+- Bounding boxes appear stuck to screen coordinates.
+- AR tracking behavior is incorrect.
+
+---
+
+TASK 1: INVESTIGATE
+
+Analyze the entire project and identify exactly how text boxes are currently being tracked.
+
+Answer the following:
+
+1. Where are OCR bounding boxes created?
+
+2. Where are OCR bounding boxes transformed into screen coordinates?
+
+3. How are boxes currently rendered?
+
+4. Is ARCore actually used for tracking?
+
+5. Are ARCore Anchors being created?
+
+6. Are HitResults being created?
+
+7. Are Anchor poses updated every frame?
+
+8. Is camera pose used for box updates?
+
+9. Are boxes redrawn from OCR coordinates only?
+
+10. Is there any feature tracking implementation?
+
+11. Is OpenCV used?
+
+12. Is optical flow used?
+
+13. Is there any tracking state machine?
+
+14. What specific code path causes the box to appear attached to the screen instead of the object?
+
+---
+
+TASK 2: REPORT
+
+Provide a report with:
+
+CRITICAL ISSUES
+MAJOR ISSUES
+MINOR ISSUES
+
+For every issue include:
+
+- File name
+- Class name
+- Method name
+- Exact explanation
+
+---
+
+TASK 3: FIX PLAN
+
+Only after analysis:
+
+Provide a step-by-step implementation plan.
+
+For every required change specify:
+
+- File
+- Method
+- Reason
+
+Do not implement yet.
+
+---
+
+TASK 4: IMPLEMENTATION
+
+Only after identifying the root cause:
+
+Implement the minimum required changes to achieve:
+
+1. Largest text target selection.
+2. Target lock.
+3. ARCore world anchor creation.
+4. Continuous pose updates.
+5. Screen projection updates every AR frame.
+6. Smooth box movement.
+7. Box remains attached to the physical text object.
+
+---
+
+SUCCESS TESTS
+
+Test A:
+Point camera at a sign.
+
+Expected:
+Box appears around sign.
+
+Test B:
+Move camera left.
+
+Expected:
+Box remains attached to sign.
+
+Test C:
+Move camera right.
+
+Expected:
+Box remains attached to sign.
+
+Test D:
+Move closer.
+
+Expected:
+Box scales naturally.
+
+Test E:
+Move farther.
+
+Expected:
+Box scales naturally.
+
+Test F:
+Rotate phone.
+
+Expected:
+Box remains attached to text.
+
+---
+
+IMPORTANT
+
+Do NOT redesign UI.
+Do NOT modify translation.
+Do NOT modify language detection.
+Do NOT add new features.
+
+Focus exclusively on identifying and fixing the root cause of world-space tracking failure.
