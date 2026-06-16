@@ -494,475 +494,68 @@ Only call the app "done" when all are true:
 
 The biggest milestone is Phase 4. If the box is still glued to the screen after Phase 4, stop everything and fix that before touching translation, fonts, colors, or UI.
 
+Current implementation is incorrect.
 
+The detected text boundary box is being treated as a 2D screen overlay.
 
-Current status:
+I want a true ARCore world-space implementation.
 
-Camera works.
+Do not modify OCR.
 
-OCR works.
+Do not modify translation.
 
-Largest text box selection works.
+Do not modify UI.
 
-The problem is tracking.
+Focus only on AR tracking.
 
----
+Requirements:
 
-CURRENT BUG
-
-A text box is detected correctly.
-
-When the camera moves:
-
-- the box drifts
-- the box freezes
-- the box remains attached to old screen coordinates
-
-The box is not attached to the real-world text.
-
----
-
-IMPORTANT
-
-Do NOT assume ARCore automatically tracks text.
-
-ARCore tracks camera motion.
-
-ML Kit OCR detects text.
-
-A proper tracking layer must be added between OCR and rendering.
-
----
-
-REQUIRED ARCHITECTURE
-
-OCR (5–8 FPS)
-↓
-Largest Text Selection
-↓
-Target Lock
-↓
-Tracking Layer (60 FPS)
-↓
-Overlay Rendering
-
----
-
-TARGET LOCK
-
-When the largest text block is selected:
-
-Store:
-
-- text
-- bounding box
-- center point
-
-This becomes the active target.
-
----
-
-TRACKING LAYER
-
-Do not wait for OCR every frame.
-
-Between OCR updates:
-
-Track the target position continuously.
-
-Use:
-
-- ARCore camera pose
-- image feature tracking
-- optical flow if needed
-
-The target must move smoothly with the real object.
-
----
-
-ARCORE USAGE
-
-Use ARCore only for:
-
-- camera pose updates
-- world tracking
-- motion estimation
-
-Use ARCore pose every frame.
-
-When camera pose changes:
-
-Update tracked target position.
-
-Reproject target into screen coordinates.
-
-Redraw overlay.
-
----
-
-SMOOTHING
-
-Never snap directly.
-
-Use interpolation.
-
-Example:
-
-currentX += (targetX - currentX) * 0.25f
-currentY += (targetY - currentY) * 0.25f
-
-Apply to:
-
-- left
-- top
-- right
-- bottom
-
-This removes jitter.
-
----
-
-OCR REFRESH
-
-OCR should run only:
-
-5–8 FPS
-
-Tracking should run:
-
-every AR frame
-
-approximately:
-
-30–60 FPS
-
----
-
-SUCCESS TEST
-
-Point at a sign.
-
-A box appears.
-
-Move camera left.
-
-Expected:
-Box follows sign.
-
-Move camera right.
-
-Expected:
-Box follows sign.
-
-Move closer.
-
-Expected:
-Box scales naturally.
-
-Move away.
-
-Expected:
-Box scales naturally.
-
-The box must never remain attached to a fixed screen position.
-
----
-
-DO NOT WORK ON
-
-- translation
-- language detection
-- text replacement
-- UI redesign
-
-Focus only on making the selected largest text box track the real-world text smoothly using ARCore pose updates and a dedicated tracking layer.
-
-Current status:
-
-- Camera works
-- OCR works
-- Largest text box selection works
-
-Problem:
-
-The selected text boundary box is rendered in screen space only.
-
-When the camera moves, the box does not remain attached to the real-world object containing the text.
-
-The box behaves like a UI overlay instead of an AR object.
-
----
-
-GOAL
-
-Convert the selected text target into a tracked AR world-space target.
-
-The boundary box must remain attached to the real object while the camera moves.
-
----
-
-REQUIRED IMPLEMENTATION
-
-When OCR selects the largest text box:
-
-1. Compute the center point of the detected text box.
-
-2. Perform an ARCore hit test using the center screen coordinate.
-
-3. If a valid hit result exists:
+1. When the largest text box is detected:
    
-   - Plane
-   - Depth point
-   - Feature point
+   - Compute its center.
+   - Perform ARCore hit testing.
+   - Find the best valid hit result.
 
-4. Create an ARCore Anchor.
+2. Create ARCore anchors.
 
-5. Store this anchor as the active text target.
+3. Do NOT continue rendering from OCR coordinates.
 
----
+4. Store anchor information.
 
-TRACKING
+5. Every AR frame:
+   
+   - Read anchor pose.
+   - Convert world coordinates to screen coordinates.
+   - Update boundary box position.
 
-Do not store only screen coordinates.
+6. Hide boundary box when anchor tracking is lost.
 
-Store:
+7. Resume when tracking returns.
 
-- Anchor
-- Pose
-- Tracking state
+Advanced requirement:
 
-Every AR frame:
+Instead of a single anchor:
 
-1. Get current camera pose.
-2. Get anchor pose.
-3. Transform anchor pose into screen coordinates.
-4. Update boundary box position.
+Create four anchors corresponding to:
 
-The boundary box should be rendered using the current projected anchor position.
+- Top Left
+- Top Right
+- Bottom Left
+- Bottom Right
 
----
+Project all four anchor positions every frame.
 
-RENDERING
+Reconstruct the boundary box from these projected points.
 
-The boundary box must be derived from:
+This allows the box to remain attached to the real-world text region instead of a single point.
 
-Anchor Pose
-→ World Coordinates
-→ Camera Coordinates
-→ Screen Coordinates
+Success criteria:
 
-Do not reuse stale OCR coordinates after lock.
+- Detect text.
+- Create anchors.
+- Move camera.
+- Boundary box remains attached to text.
+- Boundary box updates from anchor poses.
+- No rendering from stale OCR coordinates.
+- No screen-locked behavior.
 
-OCR coordinates are only used to create the initial anchor.
-
----
-
-LOST TRACKING
-
-If:
-
-anchor.getTrackingState() != TRACKING
-
-temporarily hide the box.
-
-When tracking resumes:
-
-show the box again.
-
----
-
-UPDATES
-
-OCR should run only occasionally.
-
-AR tracking should run every frame.
-
-The box position should be updated from the anchor pose continuously.
-
----
-
-SUCCESS CRITERIA
-
-1. Point camera at a sign.
-
-2. Largest text box detected.
-
-3. Anchor created.
-
-4. Move camera left.
-
-Expected:
-Boundary box remains attached to sign.
-
-5. Move camera right.
-
-Expected:
-Boundary box remains attached to sign.
-
-6. Move closer.
-
-Expected:
-Boundary box scales naturally.
-
-7. Move farther.
-
-Expected:
-Boundary box scales naturally.
-
-8. Rotate device.
-
-Expected:
-Boundary box remains attached to the text object.
-
-The boundary box must behave like an AR object in the world, not a screen overlay.
-
-
-DO NOT MODIFY ANY CODE YET.
-
-FIRST PERFORM A COMPLETE TRACKING AUDIT OF THE PROJECT.
-
-Current status:
-
-- Camera preview works.
-- OCR works.
-- Largest text box detection works.
-- Bounding boxes appear.
-- Bounding boxes do NOT stay attached to the real-world text.
-- Bounding boxes appear stuck to screen coordinates.
-- AR tracking behavior is incorrect.
-
----
-
-TASK 1: INVESTIGATE
-
-Analyze the entire project and identify exactly how text boxes are currently being tracked.
-
-Answer the following:
-
-1. Where are OCR bounding boxes created?
-
-2. Where are OCR bounding boxes transformed into screen coordinates?
-
-3. How are boxes currently rendered?
-
-4. Is ARCore actually used for tracking?
-
-5. Are ARCore Anchors being created?
-
-6. Are HitResults being created?
-
-7. Are Anchor poses updated every frame?
-
-8. Is camera pose used for box updates?
-
-9. Are boxes redrawn from OCR coordinates only?
-
-10. Is there any feature tracking implementation?
-
-11. Is OpenCV used?
-
-12. Is optical flow used?
-
-13. Is there any tracking state machine?
-
-14. What specific code path causes the box to appear attached to the screen instead of the object?
-
----
-
-TASK 2: REPORT
-
-Provide a report with:
-
-CRITICAL ISSUES
-MAJOR ISSUES
-MINOR ISSUES
-
-For every issue include:
-
-- File name
-- Class name
-- Method name
-- Exact explanation
-
----
-
-TASK 3: FIX PLAN
-
-Only after analysis:
-
-Provide a step-by-step implementation plan.
-
-For every required change specify:
-
-- File
-- Method
-- Reason
-
-Do not implement yet.
-
----
-
-TASK 4: IMPLEMENTATION
-
-Only after identifying the root cause:
-
-Implement the minimum required changes to achieve:
-
-1. Largest text target selection.
-2. Target lock.
-3. ARCore world anchor creation.
-4. Continuous pose updates.
-5. Screen projection updates every AR frame.
-6. Smooth box movement.
-7. Box remains attached to the physical text object.
-
----
-
-SUCCESS TESTS
-
-Test A:
-Point camera at a sign.
-
-Expected:
-Box appears around sign.
-
-Test B:
-Move camera left.
-
-Expected:
-Box remains attached to sign.
-
-Test C:
-Move camera right.
-
-Expected:
-Box remains attached to sign.
-
-Test D:
-Move closer.
-
-Expected:
-Box scales naturally.
-
-Test E:
-Move farther.
-
-Expected:
-Box scales naturally.
-
-Test F:
-Rotate phone.
-
-Expected:
-Box remains attached to text.
-
----
-
-IMPORTANT
-
-Do NOT redesign UI.
-Do NOT modify translation.
-Do NOT modify language detection.
-Do NOT add new features.
-
-Focus exclusively on identifying and fixing the root cause of world-space tracking failure.
