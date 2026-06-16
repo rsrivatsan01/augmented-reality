@@ -494,34 +494,196 @@ Only call the app "done" when all are true:
 
 The biggest milestone is Phase 4. If the box is still glued to the screen after Phase 4, stop everything and fix that before touching translation, fonts, colors, or UI.
 
-Do not modify code.
+DO NOT IMPLEMENT NEW FEATURES.
 
-Only inspect the project and answer.
+DO NOT REWRITE THE TRACKING SYSTEM.
 
-1. What exact RectF is currently being drawn for the boundary box?
+DO NOT ADD MORE ARCORE CODE YET.
 
-2. Which class draws the boundary box?
+The project already has:
 
-3. Which method draws the boundary box?
+- OCR working
+- Largest text box selection working
+- ARCore hit testing
+- Anchor creation
+- Anchor pose updates
+- AR frame updates
+- AR tracking update loop
+- Overlay rendering
 
-4. Is the box rendered from:
-   
-   A) OCR bounding box coordinates
+Yet the boundary box still appears visually stuck to the screen and does not remain attached to the detected text.
 
-or
+This means there is likely a bug somewhere between:
 
-B) ARCore anchor projection coordinates
+Anchor Creation
+→ Pose Update
+→ Projection
+→ SmoothedRect Update
+→ Rendering
 
-5. Is frame.hitTest() ever called?
+I need a ROOT CAUSE ANALYSIS.
 
-6. Is createAnchor() ever called?
+---
 
-7. Is anchor.getPose() ever called every frame?
+TASK
 
-8. Is projectWorldToScreen() used anywhere?
+Perform a complete diagnostic of the AR tracking pipeline.
 
-9. Is the renderer receiving updated anchor positions every frame?
+Trace the currently selected text target from OCR detection all the way to rendering.
 
-10. Is the overlay still using OCR coordinates after an anchor has been created?
+---
 
-Answer with exact filenames and methods.
+STEP 1
+
+When the text target is first detected:
+
+Log:
+
+- OCR bounding box
+- OCR center point
+- OCR image coordinates
+- OCR screen coordinates
+
+---
+
+STEP 2
+
+During ARCore hit testing:
+
+Log:
+
+- hit test X
+- hit test Y
+- hit result type
+
+Possible types:
+
+- Plane
+- DepthPoint
+- FeaturePoint
+
+Report which one is used.
+
+---
+
+STEP 3
+
+After anchor creation:
+
+Log:
+
+- Anchor world position
+- Anchor pose translation
+- Anchor pose rotation
+
+Verify that the anchor is actually created at the text location.
+
+---
+
+STEP 4
+
+For every AR frame:
+
+Log:
+
+- Current camera pose
+- Current anchor pose
+- Current projected screen coordinates
+
+Move the phone left and right during testing.
+
+Determine:
+
+Do projected coordinates change?
+
+YES or NO.
+
+---
+
+STEP 5
+
+Inspect projectToScreen().
+
+Report:
+
+- exact projection math
+- matrices used
+- view matrix
+- projection matrix
+
+Verify:
+
+world coordinates
+→ camera coordinates
+→ screen coordinates
+
+is mathematically correct.
+
+---
+
+STEP 6
+
+Inspect updateFromARTracking().
+
+Log:
+
+- projected rectangle
+- smoothed rectangle
+
+Determine:
+
+Is smoothing reducing movement?
+
+Is smoothing preventing visible updates?
+
+---
+
+STEP 7
+
+Inspect rendering.
+
+Report:
+
+- exact rectangle passed to drawBoundingBoxOutline()
+
+Verify:
+
+Is the renderer receiving updated AR coordinates every frame?
+
+Or is it drawing stale coordinates?
+
+---
+
+FINAL REPORT
+
+Provide:
+
+ROOT CAUSE
+
+Choose one:
+
+A. Anchor created at wrong position
+
+B. Projection math incorrect
+
+C. Camera pose not applied correctly
+
+D. SmoothedRect not updating
+
+E. Renderer drawing stale coordinates
+
+F. Other
+
+---
+
+IMPORTANT
+
+Do NOT modify code until root cause is identified.
+
+Do NOT add new tracking implementations.
+
+Do NOT rewrite ARCore integration.
+
+First prove exactly where the tracking pipeline fails.
+
+The goal is to identify the exact reason why the boundary box visually remains attached to the screen instead of remaining attached to the real-world text object.
