@@ -1,637 +1,300 @@
-This project is large enough that you should treat it like building a product, not a feature.
+IMPORTANT - READ FIRST
 
-Rule: Never move to the next step until the current step passes all checks.
+Before modifying ANY code:
 
+1. Read ALL project documentation.
+2. Read ALL .md files in the repository.
+3. Read architecture documents.
+4. Read implementation notes.
+5. Read tracking notes.
+6. Read OCR notes.
+7. Read ARCore notes.
+8. Read translation notes.
 
----
+Build a complete understanding of the existing implementation first.
 
-Phase 1: Stable OCR Foundation
+DO NOT assume the architecture.
 
-Prompt 1
+DO NOT rewrite working systems.
 
-Goal:
+DO NOT duplicate existing functionality.
 
-Camera + OCR + Bounding Boxes
+Create a report summarizing:
 
-Nothing else.
+- Current OCR pipeline
+- Current ARCore pipeline
+- Current tracking pipeline
+- Current translation pipeline
+- Current rendering pipeline
+- Existing anchors
+- Existing pose tracking
+- Existing projection system
 
-Requirements:
-
-Camera preview works
-
-OCR detects text
-
-Draw bounding boxes
-
-No translation
-
-No AR tracking
-
-No overlays except boxes
-
-
-Check After Completion
-
-Test:
-
-Book cover
-
-Laptop screen
-
-Poster
-
-Product label
-
-
-Must pass:
-
-✅ Camera never freezes
-
-✅ No crashes
-
-✅ Boxes appear around text
-
-✅ Boxes update live
-
-✅ No black screen
-
-❌ If any fail, stop here.
-
+Only after understanding the existing architecture should implementation begin.
 
 ---
 
-Phase 2: Largest Text Selection
+PROJECT GOAL
 
-Prompt 2
+Build a flagship-grade AR Translation system.
 
-Goal:
+The goal is NOT:
 
-Choose only ONE text block
+OCR
+↓
+Translate
+↓
+Draw text on screen
 
-Requirements:
+The goal IS:
 
-Ignore all smaller blocks
+OCR
+↓
+Identify text in world
+↓
+Attach to AR world
+↓
+Track in 3D space
+↓
+Replace text naturally
+↓
+Remain locked during movement
 
-Select largest fully visible block
-
-Reject edge-touching boxes
-
-Reject tiny detections
-
-
-Check After Completion
-
-Point at:
-
-Large title
-Small subtitle
-Tiny logo
-
-Must pass:
-
-✅ Only one box visible
-
-✅ Largest text selected
-
-✅ Selection is consistent
-
+The translation should appear attached to the real object.
 
 ---
 
-Phase 3: Target Locking
+REQUIRED FLOWCHART
 
-Prompt 3
+CAMERAX LIVE FEED
+↓
+ML KIT OCR
+↓
+DETECT ALL TEXT BLOCKS
+↓
+FILTER INVALID TEXT
 
-Goal:
-
-Stop box jumping
-
-Requirements:
-
-States:
-
-SEARCHING
-LOCKING
-LOCKED
-
-Lock only after:
-
-3 consecutive detections
-
-Check After Completion
-
-Must pass:
-
-✅ Box doesn't jump
-
-✅ Box stays on same text
-
-✅ Moving camera slightly doesn't change target
-
-✅ New text doesn't steal focus
-
-
----
-
-Phase 4: Real Tracking
-
-Prompt 4
-
-Goal:
-
-Track object
-Not screen coordinates
-
-Requirements:
-
-Use ARCore camera pose
-
-Use feature tracking
-
-Update every frame
-
-
-Check After Completion
-
-Point at sign.
-
-Move camera:
-
-Left
-
-Right
-
-Up
-
-Down
-
-Closer
-
-Further
-
-Must pass:
-
-✅ Box follows object
-
-✅ Box not glued to screen
-
-✅ No noticeable lag
-
-This is the most important phase.
-
+- tiny text
+- edge touching text
+- partial text
+- low quality text
+  ↓
+  SELECT LARGEST VALID TEXT BOX
+  ↓
+  COMPUTE
+- center
+- width
+- height
+- orientation
+  ↓
+  LOCK TARGET
+  ↓
+  ARCORE HIT TEST
+  ↓
+  PLANE / DEPTH POINT / FEATURE POINT
+  ↓
+  CREATE ANCHOR
+  ↓
+  STORE
+- anchor
+- pose
+- quaternion
+- dimensions
+- original text
+  ↓
+  STOP USING OCR COORDINATES
+  ↓
+  TRACK USING ARCORE
+  ↓
+  ANCHOR POSE UPDATE
+  ↓
+  CAMERA POSE UPDATE
+  ↓
+  QUATERNION ORIENTATION UPDATE
+  ↓
+  WORLD SPACE TARGET
+  ↓
+  PROJECT WORLD → SCREEN
+  ↓
+  BUILD TRACKED TEXT REGION
+  ↓
+  LANGUAGE IDENTIFICATION
+  ↓
+  TRANSLATION
+  ↓
+  CACHE RESULT
+  ↓
+  TEXT FITTING
+  ↓
+  TEXT REPLACEMENT
+  ↓
+  30-60 FPS RENDERING
+  ↓
+  STABLE AR TRANSLATION
 
 ---
 
-Phase 5: Tracking Smoothing
+CURRENT MAJOR ISSUE
 
-Prompt 5
+The detected text boundary box appears stuck to the screen.
 
-Goal:
+The box should remain attached to the real-world text object.
 
-Remove jitter
+The box should move naturally when:
 
-Requirements:
+- camera moves left
+- camera moves right
+- camera moves up
+- camera moves down
+- camera rotates
+- camera moves closer
+- camera moves farther
 
-Interpolation
-
-Motion smoothing
-
-Stable movement
-
-
-Check After Completion
-
-Must pass:
-
-✅ Box moves smoothly
-
-✅ No shaking
-
-✅ No flickering
-
-✅ Feels premium
-
+The box should behave as an AR object.
 
 ---
 
-Phase 6: Translation Engine
+TRACKING REQUIREMENTS
 
-Prompt 6
+After anchor creation:
 
-Goal:
+DO NOT render using OCR coordinates.
 
-Translate locked target only
+OCR coordinates are valid only for initial detection.
 
-Requirements:
+After lock:
 
-Translate only LOCKED target
+Use only:
 
-Cache translations
+- Anchor Pose
+- Camera Pose
+- Quaternion Orientation
+- World Coordinates
 
-Ignore English
+Every frame:
 
-
-Check After Completion
-
-Must pass:
-
-✅ Correct language detected
-
-✅ Correct translation
-
-✅ No repeated translation requests
-
-✅ No frame drops
-
-
----
-
-Phase 7: Text Replacement
-
-Prompt 7
-
-Goal:
-
-Replace text inside box
-
-Requirements:
-
-Fit translation inside original bounds
-
-Auto-size text
-
-Multiline support
-
-
-Check After Completion
-
-Must pass:
-
-✅ Translation stays inside box
-
-✅ No clipping
-
-✅ No overflow
-
+Anchor Pose
+↓
+World Position
+↓
+Projection
+↓
+Screen Position
+↓
+Render
 
 ---
 
-Phase 8: Font Matching
+CAMERA SHAKE REQUIREMENTS
 
-Prompt 8
-
-Goal:
-
-Match original appearance
-
-Requirements:
-
-Estimate:
-
-Font size
-
-Weight
-
-Alignment
-
-
-Check After Completion
-
-Must pass:
-
-✅ Translation resembles original layout
-
-✅ Doesn't look like random Android text
-
-
----
-
-Phase 9: Perspective Correction
-
-Prompt 9
-
-Goal:
-
-Match sign angle
-
-Requirements:
-
-Detect surface orientation
-
-Warp translation
-
-
-Check After Completion
-
-Must pass:
-
-✅ Tilt phone
-
-✅ Translation tilts with sign
-
-✅ Doesn't remain flat
-
-
----
-
-Phase 10: Color Matching
-
-Prompt 10
-
-Goal:
-
-Match text color
-
-Requirements:
-
-Extract:
-
-Text color
-
-Contrast
-
-
-Check After Completion
-
-Must pass:
-
-✅ Red text becomes red translation
-
-✅ White text becomes white translation
-
-✅ Contrast remains readable
-
-
----
-
-Phase 11: Depth Occlusion
-
-Prompt 11
-
-Goal:
-
-Translation belongs to scene
-
-Requirements:
+Camera shake must not break tracking.
 
 Use:
 
-ARCore Depth API
+- ARCore Pose Tracking
+- Quaternion Smoothing
+- Pose Smoothing
+- Motion Prediction
 
+Target FPS:
 
-Check After Completion
+30-60 FPS
 
-Must pass:
-
-✅ Hand in front hides translation
-
-✅ Person walking blocks translation
-
-✅ No rendering through objects
-
+Tracking must remain stable.
 
 ---
 
-Phase 12: World Anchors
+TEXT REPLACEMENT REQUIREMENTS
 
-Prompt 12
+Do not draw a floating translation label.
 
-Goal:
-
-Remember translated objects
+Replace the original text.
 
 Requirements:
 
-Create ARCore anchors
+- same position
+- same size
+- same orientation
+- same alignment
+- same perspective
 
-Maintain position in world space
-
-
-Check After Completion
-
-Must pass:
-
-✅ Look away
-
-✅ Look back
-
-✅ Translation reappears correctly
-
+Translation must remain inside original text bounds.
 
 ---
 
-Phase 13: Performance Pass
+TEXT FITTING REQUIREMENTS
 
-Prompt 13
+Automatically fit translated text.
 
-Goal:
+Support:
 
-Flagship smoothness
+- long translations
+- short translations
+- multiline translations
 
-Requirements:
+Never:
 
-Target:
-
-30–60 FPS camera
-
-5–8 FPS OCR
-
-60 FPS tracking
-
-
-Check After Completion
-
-Must pass:
-
-✅ No stutters
-
-✅ No ANRs
-
-✅ No memory leaks
-
-✅ No crashes
-
+- overflow
+- clip
+- overlap nearby text
 
 ---
 
-Final Flagship Checklist
+TECH STACK
 
-Only call the app "done" when all are true:
+Use:
 
-✅ Camera stable
+- CameraX
+- ML Kit Text Recognition v2
+- ML Kit Language Identification
+- ML Kit Translation
+- ARCore Session
+- ARCore Anchors
+- ARCore Hit Testing
+- ARCore Camera Pose
+- ARCore Plane Tracking
+- ARCore Depth API
 
-✅ OCR accurate
+If needed:
 
-✅ One target only
+- OpenCV Optical Flow
+- ORB Feature Tracking
 
-✅ Locking works
-
-✅ Tracking works
-
-✅ Tracking smooth
-
-✅ Translation accurate
-
-✅ Text replacement works
-
-✅ Font fitting works
-
-✅ Perspective correction works
-
-✅ Color matching works
-
-✅ Depth occlusion works
-
-✅ World anchoring works
-
-✅ No crashes
-
-✅ No black screens
-
-✅ No lag spikes
-
-✅ Feels like a camera feature, not an OCR demo
-
-The biggest milestone is Phase 4. If the box is still glued to the screen after Phase 4, stop everything and fix that before touching translation, fonts, colors, or UI.
-
-
-
-
-
-
-
-
-
-
-Root cause has been identified.
-
-Do not redesign the tracking system.
-
-Do not add new features.
-
-Do not rewrite ARCore integration.
-
-Implement only the identified fixes.
+for stronger lock stability.
 
 ---
 
-ISSUE 1
+BEFORE IMPLEMENTATION
 
-File:
-ARTextTracker
+Provide a report:
 
-Location:
-projectToScreen()
+1. What already exists.
+2. What is currently broken.
+3. Which files are responsible.
+4. Whether tracking currently uses:
+   - OCR coordinates
+   - AR anchors
+   - projected anchor coordinates
+5. Whether projection math is correct.
+6. Whether pose updates are reaching rendering.
 
-Current logic incorrectly rejects visible anchors.
-
-Current code:
-
-if (viewW != 0f && viewZ / viewW < 0f) {
-return null;
-}
-
-In ARCore/OpenGL camera space:
-
-Visible points in front of the camera typically have:
-
-viewZ < 0
-
-The current condition rejects visible anchors.
-
-Result:
-
-- projectToScreen() returns null
-- updateAll() returns empty results
-- AR tracking pipeline never updates overlay positions
-- OCR coordinates remain frozen on screen
-
-Fix the behind-camera check so only points actually behind the camera are rejected.
-
----
-
-ISSUE 2
-
-Verify projection math after the fix.
-
-Add temporary logging:
-
-- Anchor world position
-- Projected screen coordinates
-- updateAll() result count
-
-Confirm projected coordinates change when camera moves.
-
----
-
-ISSUE 3
-
-ARCore display geometry is not configured.
-
-Search entire project.
-
-Verify whether:
-
-session.setDisplayGeometry(...)
-
-is called.
-
-If missing:
-
-Implement proper display geometry updates using current:
-
-- display rotation
-- viewport width
-- viewport height
-
-Ensure hit testing and projection matrices use correct screen geometry.
-
----
-
-VALIDATION TESTS
-
-Test 1
-
-Point camera at text.
-
-Expected:
-Anchor created.
-
-Test 2
-
-Move camera left.
-
-Expected:
-Projected coordinates change.
-
-Test 3
-
-Move camera right.
-
-Expected:
-Projected coordinates change.
-
-Test 4
-
-Move closer.
-
-Expected:
-Boundary box scales naturally.
-
-Test 5
-
-Move farther.
-
-Expected:
-Boundary box scales naturally.
+Only then begin modifications.
 
 ---
 
 SUCCESS CRITERIA
 
-1. projectToScreen() returns valid coordinates.
-2. updateAll() produces active tracked targets.
-3. Overlay receives AR coordinates every frame.
-4. Boundary box moves with camera motion.
-5. Boundary box is no longer frozen at OCR coordinates.
-6. Display geometry is correctly configured.
+1. Largest text box detected.
+2. AR anchor created.
+3. Target locked.
+4. Camera moves.
+5. Boundary box remains attached to object.
+6. Translation remains attached to object.
+7. Translation updates at 30-60 FPS.
+8. Camera shake does not break lock.
+9. No screen-space drifting.
+10. No frozen boundary boxes.
+11. No translation overlap.
+12. Translation appears naturally integrated into the scene.
+
+The final result should feel like a flagship AR translation feature rather than a screen overlay.
