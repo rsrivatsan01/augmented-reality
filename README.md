@@ -1,300 +1,582 @@
-IMPORTANT - READ FIRST
+Perfect. So the flow is:
 
-Before modifying ANY code:
+**Camera auto-focuses on a flat surface or physical object → instantly captures it → registers it as the AR target → overlays 3D content/label on it in real-time.**
 
-1. Read ALL project documentation.
-2. Read ALL .md files in the repository.
-3. Read architecture documents.
-4. Read implementation notes.
-5. Read tracking notes.
-6. Read OCR notes.
-7. Read ARCore notes.
-8. Read translation notes.
-
-Build a complete understanding of the existing implementation first.
-
-DO NOT assume the architecture.
-
-DO NOT rewrite working systems.
-
-DO NOT duplicate existing functionality.
-
-Create a report summarizing:
-
-- Current OCR pipeline
-- Current ARCore pipeline
-- Current tracking pipeline
-- Current translation pipeline
-- Current rendering pipeline
-- Existing anchors
-- Existing pose tracking
-- Existing projection system
-
-Only after understanding the existing architecture should implementation begin.
+Here's the full implementation:
 
 ---
 
-PROJECT GOAL
+## `AndroidManifest.xml`
+```xml
+<uses-permission android:name="android.permission.CAMERA" />
+<uses-feature android:name="android.hardware.camera.ar" android:required="true"/>
+<uses-feature android:name="android.hardware.camera.autofocus"/>
 
-Build a flagship-grade AR Translation system.
-
-The goal is NOT:
-
-OCR
-↓
-Translate
-↓
-Draw text on screen
-
-The goal IS:
-
-OCR
-↓
-Identify text in world
-↓
-Attach to AR world
-↓
-Track in 3D space
-↓
-Replace text naturally
-↓
-Remain locked during movement
-
-The translation should appear attached to the real object.
+<application ...>
+    <meta-data android:name="com.google.ar.core" android:value="required"/>
+</application>
+```
 
 ---
 
-REQUIRED FLOWCHART
-
-CAMERAX LIVE FEED
-↓
-ML KIT OCR
-↓
-DETECT ALL TEXT BLOCKS
-↓
-FILTER INVALID TEXT
-
-- tiny text
-- edge touching text
-- partial text
-- low quality text
-  ↓
-  SELECT LARGEST VALID TEXT BOX
-  ↓
-  COMPUTE
-- center
-- width
-- height
-- orientation
-  ↓
-  LOCK TARGET
-  ↓
-  ARCORE HIT TEST
-  ↓
-  PLANE / DEPTH POINT / FEATURE POINT
-  ↓
-  CREATE ANCHOR
-  ↓
-  STORE
-- anchor
-- pose
-- quaternion
-- dimensions
-- original text
-  ↓
-  STOP USING OCR COORDINATES
-  ↓
-  TRACK USING ARCORE
-  ↓
-  ANCHOR POSE UPDATE
-  ↓
-  CAMERA POSE UPDATE
-  ↓
-  QUATERNION ORIENTATION UPDATE
-  ↓
-  WORLD SPACE TARGET
-  ↓
-  PROJECT WORLD → SCREEN
-  ↓
-  BUILD TRACKED TEXT REGION
-  ↓
-  LANGUAGE IDENTIFICATION
-  ↓
-  TRANSLATION
-  ↓
-  CACHE RESULT
-  ↓
-  TEXT FITTING
-  ↓
-  TEXT REPLACEMENT
-  ↓
-  30-60 FPS RENDERING
-  ↓
-  STABLE AR TRANSLATION
+## `build.gradle` (app level)
+```gradle
+dependencies {
+    implementation 'com.google.ar:core:1.40.0'
+    implementation 'com.google.android.filament:filament-android:1.50.0'
+}
+```
 
 ---
 
-CURRENT MAJOR ISSUE
+## `activity_main.xml`
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000">
 
-The detected text boundary box appears stuck to the screen.
+    <android.opengl.GLSurfaceView
+        android:id="@+id/gl_surface_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"/>
 
-The box should remain attached to the real-world text object.
+    <!-- Auto-focus ring indicator -->
+    <ImageView
+        android:id="@+id/focus_ring"
+        android:layout_width="80dp"
+        android:layout_height="80dp"
+        android:layout_gravity="center"
+        android:src="@drawable/ic_focus_ring"
+        android:alpha="0.0"/>
 
-The box should move naturally when:
+    <!-- Status bar -->
+    <TextView
+        android:id="@+id/status_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="#AA000000"
+        android:gravity="center"
+        android:padding="12dp"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp"
+        android:text="Point camera at any object or surface…"/>
 
-- camera moves left
-- camera moves right
-- camera moves up
-- camera moves down
-- camera rotates
-- camera moves closer
-- camera moves farther
+    <!-- Capture locked badge -->
+    <TextView
+        android:id="@+id/locked_badge"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_margin="16dp"
+        android:background="@drawable/badge_bg"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="6dp"
+        android:text="🔒 TARGET LOCKED"
+        android:textColor="#00FF88"
+        android:textSize="12sp"
+        android:visibility="gone"/>
 
-The box should behave as an AR object.
+    <!-- Reset button -->
+    <Button
+        android:id="@+id/btn_reset"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="16dp"
+        android:text="Reset"
+        android:visibility="gone"/>
 
----
-
-TRACKING REQUIREMENTS
-
-After anchor creation:
-
-DO NOT render using OCR coordinates.
-
-OCR coordinates are valid only for initial detection.
-
-After lock:
-
-Use only:
-
-- Anchor Pose
-- Camera Pose
-- Quaternion Orientation
-- World Coordinates
-
-Every frame:
-
-Anchor Pose
-↓
-World Position
-↓
-Projection
-↓
-Screen Position
-↓
-Render
-
----
-
-CAMERA SHAKE REQUIREMENTS
-
-Camera shake must not break tracking.
-
-Use:
-
-- ARCore Pose Tracking
-- Quaternion Smoothing
-- Pose Smoothing
-- Motion Prediction
-
-Target FPS:
-
-30-60 FPS
-
-Tracking must remain stable.
+</FrameLayout>
+```
 
 ---
 
-TEXT REPLACEMENT REQUIREMENTS
+## `LiveTrackingSession.java` — Core AR + Auto-Capture Engine
+```java
+import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.ImageFormat;
+import android.graphics.Rect;
+import android.graphics.YuvImage;
+import android.media.Image;
+import android.util.Log;
 
-Do not draw a floating translation label.
+import com.google.ar.core.AugmentedImageDatabase;
+import com.google.ar.core.Config;
+import com.google.ar.core.Frame;
+import com.google.ar.core.Session;
+import com.google.ar.core.exceptions.NotYetAvailableException;
 
-Replace the original text.
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
 
-Requirements:
+/**
+ * Handles live frame capture and hot-swapping the augmented image database.
+ * Called every frame from the GL thread — must be FAST.
+ */
+public class LiveTrackingSession {
 
-- same position
-- same size
-- same orientation
-- same alignment
-- same perspective
+    private static final String TAG = "LiveTrackingSession";
+    private static final int CAPTURE_COOLDOWN_FRAMES = 30; // ~1 sec at 30fps
+    private static final float FOCUS_CONFIDENCE_THRESHOLD = 0.72f;
 
-Translation must remain inside original text bounds.
+    private final Context context;
+    private Session arSession;
+
+    // State machine
+    public enum State { SCANNING, CAPTURING, TRACKING }
+    private State currentState = State.SCANNING;
+
+    private int framesSinceLastCapture = 0;
+    private OnTargetLockedListener listener;
+
+    public interface OnTargetLockedListener {
+        void onTargetLocked(Bitmap capturedFrame);
+        void onTrackingLost();
+    }
+
+    public LiveTrackingSession(Context context, Session session, OnTargetLockedListener listener) {
+        this.context = context;
+        this.arSession = session;
+        this.listener = listener;
+    }
+
+    /**
+     * Call this every GL frame. Returns current state.
+     * This is the hot path — keep it lean.
+     */
+    public State processFrame(Frame frame) {
+        framesSinceLastCapture++;
+
+        if (currentState == State.SCANNING) {
+            tryAutoCapture(frame);
+        }
+
+        return currentState;
+    }
+
+    /**
+     * Auto-capture when ARCore reports confident focus + stable motion.
+     */
+    private void tryAutoCapture(Frame frame) {
+        if (framesSinceLastCapture < CAPTURE_COOLDOWN_FRAMES) return;
+
+        // Check camera focus confidence via ARCore's image metadata
+        // ARCore sets CONTROL_AF_STATE to FOCUSED_LOCKED when sharp
+        try {
+            android.hardware.camera2.CaptureResult metadata =
+                frame.getImageMetadata();
+            Integer afState = metadata.get(
+                android.hardware.camera2.CaptureResult.CONTROL_AF_STATE);
+
+            boolean isFocused =
+                afState != null && (
+                    afState == android.hardware.camera2.CaptureResult
+                        .CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                    afState == android.hardware.camera2.CaptureResult
+                        .CONTROL_AF_STATE_PASSIVE_FOCUSED
+                );
+
+            if (!isFocused) return;
+
+        } catch (Exception e) {
+            // Some devices don't expose AF state — proceed anyway
+        }
+
+        // Check device is not moving fast (blurry capture = bad tracking)
+        float[] linearAccel = frame.getAndroidSensorPose() != null
+            ? new float[]{0, 0, 0} : null; // placeholder — see MotionGuard below
+
+        // Capture the camera image
+        captureAndRegister(frame);
+    }
+
+    /**
+     * Grab the current camera frame, convert to Bitmap,
+     * and hot-swap the AR image database.
+     */
+    private void captureAndRegister(Frame frame) {
+        currentState = State.CAPTURING;
+        framesSinceLastCapture = 0;
+
+        try (Image cameraImage = frame.acquireCameraImage()) {
+
+            Bitmap captured = imageToBitmap(cameraImage);
+            if (captured == null) {
+                currentState = State.SCANNING;
+                return;
+            }
+
+            // Resize for speed — ARCore tracking works well at 320×240
+            Bitmap scaled = Bitmap.createScaledBitmap(captured, 320, 240, true);
+            captured.recycle();
+
+            // Hot-swap the augmented image database on the GL thread
+            boolean success = registerLiveTarget(scaled);
+
+            if (success) {
+                currentState = State.TRACKING;
+                if (listener != null) listener.onTargetLocked(scaled);
+            } else {
+                currentState = State.SCANNING;
+            }
+
+        } catch (NotYetAvailableException e) {
+            Log.d(TAG, "Camera image not ready yet");
+            currentState = State.SCANNING;
+        } catch (Exception e) {
+            Log.e(TAG, "Capture failed: " + e.getMessage());
+            currentState = State.SCANNING;
+        }
+    }
+
+    /**
+     * Creates a new AugmentedImageDatabase with the live frame
+     * and reconfigures the session instantly.
+     */
+    private boolean registerLiveTarget(Bitmap bitmap) {
+        try {
+            AugmentedImageDatabase db = new AugmentedImageDatabase(arSession);
+
+            // addImage returns -1 on failure
+            // Provide real-world width estimate (meters) for better tracking speed
+            int idx = db.addImage("live-target", bitmap, 0.20f); // assume ~20cm wide
+            if (idx < 0) {
+                Log.w(TAG, "Image rejected by ARCore (too blurry or featureless)");
+                return false;
+            }
+
+            Config config = new Config(arSession);
+            config.setFocusMode(Config.FocusMode.AUTO);
+            config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE); // FAST mode
+            config.setAugmentedImageDatabase(db);
+            arSession.configure(config);
+
+            Log.i(TAG, "Live target registered at index " + idx);
+            return true;
+
+        } catch (Exception e) {
+            Log.e(TAG, "Database registration failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Convert camera Image (YUV_420_888) → Bitmap.
+     * This runs on the GL thread so must complete in <3ms.
+     */
+    private Bitmap imageToBitmap(Image image) {
+        // Fast path: use JPEG plane if available (some devices)
+        if (image.getFormat() == ImageFormat.JPEG) {
+            ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.get(bytes);
+            return BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        }
+
+        // Standard path: YUV_420_888 → NV21 → JPEG → Bitmap
+        if (image.getFormat() == ImageFormat.YUV_420_888) {
+            return yuv420ToBitmap(image);
+        }
+
+        return null;
+    }
+
+    private Bitmap yuv420ToBitmap(Image image) {
+        Image.Plane[] planes = image.getPlanes();
+        ByteBuffer yBuffer = planes[0].getBuffer();
+        ByteBuffer uBuffer = planes[1].getBuffer();
+        ByteBuffer vBuffer = planes[2].getBuffer();
+
+        int ySize = yBuffer.remaining();
+        int uSize = uBuffer.remaining();
+        int vSize = vBuffer.remaining();
+
+        byte[] nv21 = new byte[ySize + uSize + vSize];
+        yBuffer.get(nv21, 0, ySize);
+        vBuffer.get(nv21, ySize, vSize);          // V before U for NV21
+        uBuffer.get(nv21, ySize + vSize, uSize);
+
+        int w = image.getWidth();
+        int h = image.getHeight();
+
+        YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, w, h, null);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        yuvImage.compressToJpeg(new Rect(0, 0, w, h), 85, out); // 85% quality, fast
+
+        byte[] jpegBytes = out.toByteArray();
+        return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
+    }
+
+    public void reset() {
+        currentState = State.SCANNING;
+        framesSinceLastCapture = CAPTURE_COOLDOWN_FRAMES; // allow immediate re-capture
+        if (listener != null) listener.onTrackingLost();
+
+        // Clear the database
+        try {
+            Config config = new Config(arSession);
+            config.setFocusMode(Config.FocusMode.AUTO);
+            config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
+            config.setAugmentedImageDatabase(new AugmentedImageDatabase(arSession));
+            arSession.configure(config);
+        } catch (Exception e) {
+            Log.e(TAG, "Reset failed: " + e.getMessage());
+        }
+    }
+
+    public State getState() { return currentState; }
+}
+```
 
 ---
 
-TEXT FITTING REQUIREMENTS
+## `AROverlayRenderer.java` — GL Renderer with Tracking + Overlay
+```java
+import android.content.Context;
+import android.opengl.GLES20;
+import android.opengl.GLSurfaceView;
+import android.opengl.Matrix;
 
-Automatically fit translated text.
+import com.google.ar.core.Anchor;
+import com.google.ar.core.AugmentedImage;
+import com.google.ar.core.Camera;
+import com.google.ar.core.Frame;
+import com.google.ar.core.Pose;
+import com.google.ar.core.Session;
+import com.google.ar.core.TrackingState;
 
-Support:
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
 
-- long translations
-- short translations
-- multiline translations
+import javax.microedition.khronos.egl.EGLConfig;
+import javax.microedition.khronos.opengles.GL10;
 
-Never:
+public class AROverlayRenderer implements GLSurfaceView.Renderer {
 
-- overflow
-- clip
-- overlap nearby text
+    private static final String TAG = "AROverlayRenderer";
+
+    private final Context context;
+    private Session session;
+    private LiveTrackingSession trackingSession;
+
+    private final BackgroundRenderer backgroundRenderer = new BackgroundRenderer();
+    private final ObjectRenderer overlayObject = new ObjectRenderer(); // your 3D label/model
+
+    // Anchors for each tracked image
+    private final Map<String, Anchor> imageAnchors = new HashMap<>();
+
+    // Matrices
+    private final float[] projMatrix = new float[16];
+    private final float[] viewMatrix = new float[16];
+
+    // Callback to update UI
+    private FrameCallback frameCallback;
+
+    public interface FrameCallback {
+        void onStateChanged(LiveTrackingSession.State state, int trackedCount);
+    }
+
+    public AROverlayRenderer(Context context, FrameCallback callback) {
+        this.context = context;
+        this.frameCallback = callback;
+    }
+
+    public void setSession(Session session, LiveTrackingSession trackingSession) {
+        this.session = session;
+        this.trackingSession = trackingSession;
+    }
+
+    @Override
+    public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+        GLES20.glClearColor(0f, 0f, 0f, 1f);
+        try {
+            backgroundRenderer.createOnGlThread(context);
+            // Load your 3D overlay model (OBJ/GLTF)
+            overlayObject.createOnGlThread(context, "models/label.obj", "models/label.png");
+            overlayObject.setMaterialProperties(0f, 1f, 0.1f, 6f);
+        } catch (Exception e) {
+            android.util.Log.e(TAG, "GL init failed", e);
+        }
+    }
+
+    @Override
+    public void onSurfaceChanged(GL10 gl, int width, int height) {
+        GLES20.glViewport(0, 0, width, height);
+        // Let ARCore know about display rotation
+        if (session != null) {
+            session.setDisplayGeometry(
+                context instanceof android.app.Activity
+                    ? ((android.app.Activity) context).getWindowManager()
+                        .getDefaultDisplay().getRotation()
+                    : 0,
+                width, height
+            );
+        }
+    }
+
+    @Override
+    public void onDrawFrame(GL10 gl) {
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
+
+        if (session == null) return;
+
+        try {
+            session.setCameraTextureName(backgroundRenderer.getTextureId());
+            Frame frame = session.update();
+            Camera camera = frame.getCamera();
+
+            // ── 1. Draw camera background (live preview) ──────────────────
+            backgroundRenderer.draw(frame);
+
+            // ── 2. Auto-capture logic ──────────────────────────────────────
+            LiveTrackingSession.State state = trackingSession.processFrame(frame);
+
+            // ── 3. Camera matrices ─────────────────────────────────────────
+            if (camera.getTrackingState() != TrackingState.TRACKING) return;
+
+            camera.getProjectionMatrix(projMatrix, 0, 0.1f, 100.0f);
+            camera.getViewMatrix(viewMatrix, 0);
+
+            // ── 4. Process tracked augmented images ────────────────────────
+            Collection<AugmentedImage> augImages =
+                frame.getUpdatedTrackables(AugmentedImage.class);
+
+            int trackedCount = 0;
+
+            for (AugmentedImage img : augImages) {
+                switch (img.getTrackingState()) {
+
+                    case TRACKING:
+                        trackedCount++;
+                        // Create anchor once per image
+                        if (!imageAnchors.containsKey(img.getName())) {
+                            Anchor anchor = img.createAnchor(img.getCenterPose());
+                            imageAnchors.put(img.getName(), anchor);
+                        }
+                        // Draw overlay at image center
+                        drawOverlay(img, imageAnchors.get(img.getName()));
+                        break;
+
+                    case STOPPED:
+                        // Clean up anchor when lost
+                        Anchor old = imageAnchors.remove(img.getName());
+                        if (old != null) old.detach();
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+
+            // Notify UI thread
+            if (frameCallback != null) {
+                final LiveTrackingSession.State finalState = state;
+                final int finalCount = trackedCount;
+                ((android.app.Activity) context).runOnUiThread(() ->
+                    frameCallback.onStateChanged(finalState, finalCount));
+            }
+
+        } catch (Exception e) {
+            android.util.Log.e(TAG, "Frame error: " + e.getMessage());
+        }
+    }
+
+    private void drawOverlay(AugmentedImage image, Anchor anchor) {
+        if (anchor == null || anchor.getTrackingState() != TrackingState.TRACKING) return;
+
+        float[] anchorMatrix = new float[16];
+        anchor.getPose().toMatrix(anchorMatrix, 0);
+
+        // Scale overlay to match image size
+        float[] scaleMatrix = new float[16];
+        Matrix.setIdentityM(scaleMatrix, 0);
+        float s = image.getExtentX(); // real-world width of tracked image
+        Matrix.scaleM(scaleMatrix, 0, s, s, s);
+
+        float[] modelMatrix = new float[16];
+        Matrix.multiplyMM(modelMatrix, 0, anchorMatrix, 0, scaleMatrix, 0);
+
+        // Draw the 3D label/model on top of the tracked image
+        overlayObject.updateModelMatrix(modelMatrix, 1.0f);
+        overlayObject.draw(viewMatrix, projMatrix,
+            new float[]{0.5f, 0.8f, 0.5f}, // light direction
+            new float[]{1f, 1f, 1f, 1f});   // white color tint
+    }
+}
+```
 
 ---
 
-TECH STACK
+## `MainActivity.java` — Wires Everything Together
+```java
+import android.opengl.GLSurfaceView;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.Button;
+import android.widget.TextView;
+import androidx.appcompat.app.AppCompatActivity;
+import com.google.ar.core.*;
+import com.google.ar.core.exceptions.*;
 
-Use:
+public class MainActivity extends AppCompatActivity
+    implements LiveTrackingSession.OnTargetLockedListener,
+               AROverlayRenderer.FrameCallback {
 
-- CameraX
-- ML Kit Text Recognition v2
-- ML Kit Language Identification
-- ML Kit Translation
-- ARCore Session
-- ARCore Anchors
-- ARCore Hit Testing
-- ARCore Camera Pose
-- ARCore Plane Tracking
-- ARCore Depth API
+    private GLSurfaceView glView;
+    private TextView statusText;
+    private View lockedBadge, focusRing;
+    private Button btnReset;
 
-If needed:
+    private Session arSession;
+    private LiveTrackingSession liveTracking;
+    private AROverlayRenderer renderer;
 
-- OpenCV Optical Flow
-- ORB Feature Tracking
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
 
-for stronger lock stability.
+        glView      = findViewById(R.id.gl_surface_view);
+        statusText  = findViewById(R.id.status_text);
+        lockedBadge = findViewById(R.id.locked_badge);
+        focusRing   = findViewById(R.id.focus_ring);
+        btnReset    = findViewById(R.id.btn_reset);
 
----
+        glView.setPreserveEGLContextOnPause(true);
+        glView.setEGLContextClientVersion(2);
 
-BEFORE IMPLEMENTATION
+        renderer = new AROverlayRenderer(this, this);
+        glView.setRenderer(renderer);
+        glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
 
-Provide a report:
+        btnReset.setOnClickListener(v -> {
+            liveTracking.reset();
+            lockedBadge.setVisibility(View.GONE);
+            btnReset.setVisibility(View.GONE);
+            statusText.setText("Point camera at any object or surface…");
+        });
+    }
 
-1. What already exists.
-2. What is currently broken.
-3. Which files are responsible.
-4. Whether tracking currently uses:
-   - OCR coordinates
-   - AR anchors
-   - projected anchor coordinates
-5. Whether projection math is correct.
-6. Whether pose updates are reaching rendering.
+    @Override
+    protected void onResume() {
+        super.onResume();
+        try {
+            if (arSession == null) {
+                arSession = new Session(this);
 
-Only then begin modifications.
+                // Speed-optimised config — no plane detection, no depth
+                Config config = new Config(arSession);
+                config.setPlaneFindingMode(Config.PlaneFindingMode.DISABLED);
+                config.setDepthMode(Config.DepthMode.DISABLED);
+                config.setLightEstimationMode(Config.LightEstimationMode.DISABLED);
+                config.setFocusMode(Config.FocusMode.AUTO);
+                config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
+                arSession.configure(config);
 
----
-
-SUCCESS CRITERIA
-
-1. Largest text box detected.
-2. AR anchor created.
-3. Target locked.
-4. Camera moves.
-5. Boundary box remains attached to object.
-6. Translation remains attached to object.
-7. Translation updates at 30-60 FPS.
-8. Camera shake does not break lock.
-9. No screen-space drifting.
-10. No frozen boundary boxes.
-11. No translation overlap.
-12. Translation appears naturally integrated into the scene.
-
-The final result should feel like a flagship AR translation feature rather than a screen overlay.
+                liveTracking = new LiveTrackingSession(this, arSessio
