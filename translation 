@@ -1,0 +1,561 @@
+Perfect. Here's the full implementation:
+
+---
+
+## `build.gradle` (app level)
+```gradle
+dependencies {
+    // ML Kit Text Recognition
+    implementation 'com.google.mlkit:text-recognition:16.0.0'
+
+    // ML Kit Translation (downloads language models on demand)
+    implementation 'com.google.mlkit:translate:17.0.2'
+
+    // CameraX
+    implementation 'androidx.camera:camera-core:1.3.1'
+    implementation 'androidx.camera:camera-camera2:1.3.1'
+    implementation 'androidx.camera:camera-lifecycle:1.3.1'
+    implementation 'androidx.camera:camera-view:1.3.1'
+}
+```
+
+---
+
+## `LanguageManager.java` — All supported languages in one place
+```java
+package com.yourapp;
+
+import com.google.mlkit.nl.translate.TranslateLanguage;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class LanguageManager {
+
+    // Display name → ML Kit language code
+    public static final Map<String, String> LANGUAGES = new LinkedHashMap<>();
+
+    static {
+        LANGUAGES.put("Auto Detect",  "auto");
+        LANGUAGES.put("English",      TranslateLanguage.ENGLISH);
+        LANGUAGES.put("Hindi",        TranslateLanguage.HINDI);
+        LANGUAGES.put("French",       TranslateLanguage.FRENCH);
+        LANGUAGES.put("Spanish",      TranslateLanguage.SPANISH);
+        LANGUAGES.put("German",       TranslateLanguage.GERMAN);
+        LANGUAGES.put("Chinese",      TranslateLanguage.CHINESE);
+        LANGUAGES.put("Japanese",     TranslateLanguage.JAPANESE);
+        LANGUAGES.put("Korean",       TranslateLanguage.KOREAN);
+        LANGUAGES.put("Arabic",       TranslateLanguage.ARABIC);
+        LANGUAGES.put("Portuguese",   TranslateLanguage.PORTUGUESE);
+        LANGUAGES.put("Russian",      TranslateLanguage.RUSSIAN);
+        LANGUAGES.put("Italian",      TranslateLanguage.ITALIAN);
+        LANGUAGES.put("Turkish",      TranslateLanguage.TURKISH);
+        LANGUAGES.put("Dutch",        TranslateLanguage.DUTCH);
+        LANGUAGES.put("Polish",       TranslateLanguage.POLISH);
+        LANGUAGES.put("Bengali",      TranslateLanguage.BENGALI);
+        LANGUAGES.put("Tamil",        TranslateLanguage.TAMIL);
+        LANGUAGES.put("Telugu",       TranslateLanguage.TELUGU);
+    }
+
+    public static String[] getDisplayNames() {
+        return LANGUAGES.keySet().toArray(new String[0]);
+    }
+
+    public static String getCode(String displayName) {
+        return LANGUAGES.getOrDefault(displayName, TranslateLanguage.ENGLISH);
+    }
+}
+```
+
+---
+
+## `TranslationProcessor.java` — ML Kit Translation wrapper
+```java
+package com.yourapp;
+
+import com.google.mlkit.common.model.DownloadConditions;
+import com.google.mlkit.nl.languageid.LanguageIdentification;
+import com.google.mlkit.nl.languageid.LanguageIdentifier;
+import com.google.mlkit.nl.translate.TranslateLanguage;
+import com.google.mlkit.nl.translate.Translation;
+import com.google.mlkit.nl.translate.Translator;
+import com.google.mlkit.nl.translate.TranslatorOptions;
+
+import java.util.List;
+import java.util.ArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class TranslationProcessor {
+
+    public interface TranslationCallback {
+        void onComplete(List<String> translatedBlocks);
+        void onError(String error);
+        void onDownloadProgress(String message);
+    }
+
+    private Translator currentTranslator;
+    private final LanguageIdentifier languageIdentifier;
+
+    public TranslationProcessor() {
+        languageIdentifier = LanguageIdentification.getClient();
+    }
+
+    /**
+     * Translates a list of text blocks.
+     * If sourceCode is "auto", ML Kit identifies the language first.
+     */
+    public void translate(List<String> textBlocks,
+                          String sourceCode,
+                          String targetCode,
+                          TranslationCallback callback) {
+
+        if (textBlocks == null || textBlocks.isEmpty()) {
+            callback.onError("No text to translate");
+            return;
+        }
+
+        if (sourceCode.equals("auto")) {
+            // Auto-detect source language from the first block
+            String combinedText = String.join(" ", textBlocks);
+            languageIdentifier.identifyLanguage(combinedText)
+                .addOnSuccessListener(detectedCode -> {
+                    String resolvedCode = detectedCode.equals("und")
+                        ? TranslateLanguage.ENGLISH // fallback
+                        : detectedCode;
+                    buildAndTranslate(textBlocks, resolvedCode, targetCode, callback);
+                })
+                .addOnFailureListener(e ->
+                    buildAndTranslate(textBlocks,
+                        TranslateLanguage.ENGLISH, targetCode, callback));
+        } else {
+            buildAndTranslate(textBlocks, sourceCode, targetCode, callback);
+        }
+    }
+
+    private void buildAndTranslate(List<String> blocks,
+                                   String sourceCode,
+                                   String targetCode,
+                                   TranslationCallback callback) {
+
+        // Same language — no translation needed
+        if (sourceCode.equals(targetCode)) {
+            callback.onComplete(blocks);
+            return;
+        }
+
+        // Release previous translator
+        if (currentTranslator != null) currentTranslator.close();
+
+        TranslatorOptions options = new TranslatorOptions.Builder()
+            .setSourceLanguage(sourceCode)
+            .setTargetLanguage(targetCode)
+            .build();
+
+        currentTranslator = Translation.getClient(options);
+
+        // Download language model if not already on device
+        DownloadConditions conditions = new DownloadConditions.Builder()
+            .requireWifi() // remove this if you want download on mobile data too
+            .build();
+
+        callback.onDownloadProgress("Downloading language model…");
+
+        currentTranslator.downloadModelIfNeeded(conditions)
+            .addOnSuccessListener(v -> translateAllBlocks(blocks, callback))
+            .addOnFailureListener(e ->
+                callback.onError("Model download failed: " + e.getMessage()));
+    }
+
+    /**
+     * Translates each block individually so positions stay mapped 1-to-1.
+     */
+    private void translateAllBlocks(List<String> blocks, TranslationCallback callback) {
+        List<String> results = new ArrayList<>();
+        for (int i = 0; i < blocks.size(); i++) results.add("");
+
+        AtomicInteger pending = new AtomicInteger(blocks.size());
+
+        for (int i = 0; i < blocks.size(); i++) {
+            final int index = i;
+            currentTranslator.translate(blocks.get(i))
+                .addOnSuccessListener(translated -> {
+                    results.set(index, translated);
+                    if (pending.decrementAndGet() == 0) {
+                        callback.onComplete(results);
+                    }
+                })
+                .addOnFailureListener(e -> {
+                    results.set(index, blocks.get(index)); // fallback: original
+                    if (pending.decrementAndGet() == 0) {
+                        callback.onComplete(results);
+                    }
+                });
+        }
+    }
+
+    public void close() {
+        if (currentTranslator != null) currentTranslator.close();
+        languageIdentifier.close();
+    }
+}
+```
+
+---
+
+## `TranslatedOverlayView.java` — Draws translated text exactly over detected positions
+```java
+package com.yourapp;
+
+import android.content.Context;
+import android.graphics.*;
+import android.util.AttributeSet;
+import android.view.View;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class TranslatedOverlayView extends View {
+
+    public static class OverlayBlock {
+        public RectF bounds;
+        public String originalText;
+        public String translatedText;
+
+        public OverlayBlock(RectF bounds, String original, String translated) {
+            this.bounds = bounds;
+            this.originalText = original;
+            this.translatedText = translated;
+        }
+    }
+
+    private final List<OverlayBlock> blocks = new ArrayList<>();
+    private int imageWidth = 1, imageHeight = 1;
+
+    // Paints
+    private final Paint maskPaint;       // covers original text
+    private final Paint translatedPaint; // translated text
+    private final Paint boxPaint;        // border
+    private final Paint cornerPaint;     // AR corner accents
+    private final Paint originalPaint;   // small original text below
+
+    public TranslatedOverlayView(Context context, AttributeSet attrs) {
+        super(context, attrs);
+
+        // Mask that hides original text on the frozen frame
+        maskPaint = new Paint();
+        maskPaint.setStyle(Paint.Style.FILL);
+        maskPaint.setColor(Color.parseColor("#E6001F3F")); // 90% dark blue
+
+        // Large translated text
+        translatedPaint = new Paint();
+        translatedPaint.setColor(Color.parseColor("#00E5FF")); // cyan
+        translatedPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        translatedPaint.setAntiAlias(true);
+
+        // Small original text (shown dimmed below translation)
+        originalPaint = new Paint();
+        originalPaint.setColor(Color.parseColor("#99FFFFFF"));
+        originalPaint.setTypeface(Typeface.DEFAULT);
+        originalPaint.setAntiAlias(true);
+
+        // Bounding box
+        boxPaint = new Paint();
+        boxPaint.setStyle(Paint.Style.STROKE);
+        boxPaint.setColor(Color.parseColor("#00E5FF"));
+        boxPaint.setStrokeWidth(2.5f);
+        boxPaint.setAntiAlias(true);
+
+        // Corner accents
+        cornerPaint = new Paint();
+        cornerPaint.setStyle(Paint.Style.STROKE);
+        cornerPaint.setColor(Color.parseColor("#00E5FF"));
+        cornerPaint.setStrokeWidth(6f);
+        cornerPaint.setStrokeCap(Paint.Cap.ROUND);
+        cornerPaint.setAntiAlias(true);
+    }
+
+    public void setResults(List<OverlayBlock> overlayBlocks, int imgW, int imgH) {
+        blocks.clear();
+        blocks.addAll(overlayBlocks);
+        imageWidth  = imgW;
+        imageHeight = imgH;
+        invalidate();
+    }
+
+    public void clear() {
+        blocks.clear();
+        invalidate();
+    }
+
+    @Override
+    protected void onDraw(Canvas canvas) {
+        super.onDraw(canvas);
+        if (blocks.isEmpty()) return;
+
+        float scaleX = (float) getWidth()  / imageWidth;
+        float scaleY = (float) getHeight() / imageHeight;
+
+        for (OverlayBlock block : blocks) {
+            RectF r = new RectF(
+                block.bounds.left   * scaleX,
+                block.bounds.top    * scaleY,
+                block.bounds.right  * scaleX,
+                block.bounds.bottom * scaleY
+            );
+
+            float boxW = r.width();
+            float boxH = r.height();
+
+            // 1. Mask — covers original text in the frozen frame
+            canvas.drawRoundRect(r, 6f, 6f, maskPaint);
+
+            // 2. Bounding box border
+            canvas.drawRoundRect(r, 6f, 6f, boxPaint);
+
+            // 3. Corner accents
+            drawCorners(canvas, r);
+
+            // 4. Fit translated text inside the box
+            float fontSize = fitTextSize(block.translatedText, boxW - 16f, boxH * 0.65f);
+            translatedPaint.setTextSize(fontSize);
+
+            drawWrappedText(canvas, block.translatedText,
+                r.left + 8f, r.top + fontSize + 4f,
+                boxW - 16f, boxH * 0.65f, translatedPaint);
+
+            // 5. Small original text dimmed at bottom of box
+            float smallSize = Math.max(20f, fontSize * 0.45f);
+            originalPaint.setTextSize(smallSize);
+            String orig = block.originalText.replace("\n", " ");
+            if (originalPaint.measureText(orig) > boxW - 16f) {
+                orig = orig.substring(0, Math.min(orig.length(), 30)) + "…";
+            }
+            canvas.drawText(orig, r.left + 8f, r.bottom - 8f, originalPaint);
+        }
+    }
+
+    /**
+     * Binary search to find the largest font size that fits text in the given box.
+     */
+    private float fitTextSize(String text, float maxWidth, float maxHeight) {
+        Paint p = new Paint(translatedPaint);
+        float lo = 18f, hi = 80f;
+        while (hi - lo > 1f) {
+            float mid = (lo + hi) / 2f;
+            p.setTextSize(mid);
+            float textW = p.measureText(text);
+            int lines = (int) Math.ceil(textW / maxWidth);
+            float totalH = lines * (mid * 1.2f);
+            if (totalH <= maxHeight && textW / lines <= maxWidth) hi = mid;
+            else lo = mid;
+        }
+        return lo;
+    }
+
+    /** Draws text wrapped within maxWidth, stopping if it exceeds maxHeight. */
+    private void drawWrappedText(Canvas canvas, String text,
+                                  float x, float y,
+                                  float maxWidth, float maxHeight,
+                                  Paint paint) {
+        String[] words = text.split(" ");
+        StringBuilder line = new StringBuilder();
+        float lineHeight = paint.getTextSize() * 1.25f;
+        float currentY = y;
+
+        for (String word : words) {
+            String test = line.length() == 0 ? word : line + " " + word;
+            if (paint.measureText(test) > maxWidth) {
+                if (currentY - y + lineHeight > maxHeight) break;
+                canvas.drawText(line.toString(), x, currentY, paint);
+                currentY += lineHeight;
+                line = new StringBuilder(word);
+            } else {
+                line = new StringBuilder(test);
+            }
+        }
+        if (line.length() > 0 && currentY - y <= maxHeight) {
+            canvas.drawText(line.toString(), x, currentY, paint);
+        }
+    }
+
+    private void drawCorners(Canvas canvas, RectF r) {
+        float len = 24f;
+        canvas.drawLine(r.left,  r.top,    r.left + len, r.top,    cornerPaint);
+        canvas.drawLine(r.left,  r.top,    r.left,  r.top + len,   cornerPaint);
+        canvas.drawLine(r.right, r.top,    r.right - len, r.top,   cornerPaint);
+        canvas.drawLine(r.right, r.top,    r.right, r.top + len,   cornerPaint);
+        canvas.drawLine(r.left,  r.bottom, r.left + len, r.bottom, cornerPaint);
+        canvas.drawLine(r.left,  r.bottom, r.left,  r.bottom - len,cornerPaint);
+        canvas.drawLine(r.right, r.bottom, r.right - len, r.bottom,cornerPaint);
+        canvas.drawLine(r.right, r.bottom, r.right, r.bottom - len,cornerPaint);
+    }
+}
+```
+
+---
+
+## `activity_main.xml`
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000">
+
+    <!-- Live camera -->
+    <androidx.camera.view.PreviewView
+        android:id="@+id/camera_preview"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"/>
+
+    <!-- Frozen captured frame -->
+    <ImageView
+        android:id="@+id/frozen_frame"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:visibility="gone"/>
+
+    <!-- AR overlay (translated text) -->
+    <com.yourapp.TranslatedOverlayView
+        android:id="@+id/translated_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"/>
+
+    <!-- Language selectors — shown before scanning -->
+    <LinearLayout
+        android:id="@+id/language_panel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:background="#CC000000"
+        android:orientation="horizontal"
+        android:padding="12dp"
+        android:gravity="center_vertical">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:layout_marginEnd="8dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Source"
+                android:textColor="#99FFFFFF"
+                android:textSize="11sp"/>
+
+            <Spinner
+                android:id="@+id/spinner_source"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:background="@drawable/spinner_bg"
+                android:popupBackground="#001F3F"/>
+
+        </LinearLayout>
+
+        <!-- Swap button -->
+        <ImageButton
+            android:id="@+id/btn_swap"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:src="@drawable/ic_swap"
+            android:tint="#00E5FF"
+            android:layout_marginHorizontal="4dp"/>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:layout_marginStart="8dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Target"
+                android:textColor="#99FFFFFF"
+                android:textSize="11sp"/>
+
+            <Spinner
+                android:id="@+id/spinner_target"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:background="@drawable/spinner_bg"
+                android:popupBackground="#001F3F"/>
+
+        </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- Bottom controls -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="#CC000000"
+        android:orientation="vertical"
+        android:padding="20dp"
+        android:gravity="center">
+
+        <TextView
+            android:id="@+id/status_text"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:layout_marginBottom="16dp"
+            android:text="Select languages, then tap to scan"/>
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center">
+
+            <Button
+                android:id="@+id/btn_capture"
+                android:layout_width="72dp"
+                android:layout_height="72dp"
+                android:backgroundTint="#00E5FF"
+                android:text=""
+                android:elevation="8dp"/>
+
+            <Button
+                android:id="@+id/btn_reset"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="20dp"
+                android:text="Scan Again"
+                android:backgroundTint="#334455"
+                android:textColor="#FFFFFF"
+                android:visibility="gone"/>
+
+        </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- Loading spinner -->
+    <LinearLayout
+        android:id="@+id/loading_panel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="#CC000000"
+        android:orientation="vertical"
+        android:padding="24dp"
+        android:gravity="center"
+        android:visibility="gone">
+
+        <ProgressBar
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:indeterminateTint="#00E5FF"/>
+
+        <TextView
+            android:id="@+id/loading_text"
+            android:layout_width="wrap_content"
+            android:layou
