@@ -1,0 +1,573 @@
+Perfect. So the flow is:
+
+**Tap to capture → ML Kit scans the photo → text blocks appear overlaid exactly where they are in the image, AR style.**
+
+---
+
+## `build.gradle` (app level)
+```gradle
+dependencies {
+    // ML Kit Text Recognition
+    implementation 'com.google.mlkit:text-recognition:16.0.0'
+
+    // CameraX for camera preview + capture
+    implementation 'androidx.camera:camera-core:1.3.1'
+    implementation 'androidx.camera:camera-camera2:1.3.1'
+    implementation 'androidx.camera:camera-lifecycle:1.3.1'
+    implementation 'androidx.camera:camera-view:1.3.1'
+}
+```
+
+---
+
+## `AndroidManifest.xml`
+```xml
+<uses-permission android:name="android.permission.CAMERA"/>
+<uses-feature android:name="android.hardware.camera" android:required="true"/>
+```
+
+---
+
+## `activity_main.xml`
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000">
+
+    <!-- Live camera preview -->
+    <androidx.camera.view.PreviewView
+        android:id="@+id/camera_preview"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"/>
+
+    <!-- Custom overlay — draws bounding boxes + text labels on top -->
+    <com.yourapp.TextOverlayView
+        android:id="@+id/text_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"/>
+
+    <!-- Frozen captured frame shown during processing -->
+    <ImageView
+        android:id="@+id/frozen_frame"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:visibility="gone"/>
+
+    <!-- Capture button -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:id="@+id/status_text"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:layout_marginBottom="16dp"
+            android:text="Tap the button to scan text"/>
+
+        <Button
+            android:id="@+id/btn_capture"
+            android:layout_width="72dp"
+            android:layout_height="72dp"
+            android:layout_gravity="center_horizontal"
+            android:backgroundTint="#FFFFFF"
+            android:text=""
+            android:elevation="8dp"/>
+
+        <Button
+            android:id="@+id/btn_reset"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="12dp"
+            android:text="Scan Again"
+            android:visibility="gone"/>
+
+    </LinearLayout>
+
+</FrameLayout>
+```
+
+---
+
+## `TextOverlayView.java` — Custom View that draws AR-style text labels
+```java
+package com.yourapp;
+
+import android.content.Context;
+import android.graphics.*;
+import android.util.AttributeSet;
+import android.view.View;
+
+import com.google.mlkit.vision.text.Text;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Transparent overlay drawn on top of the camera preview.
+ * Draws each detected text block exactly where it appears in the image.
+ */
+public class TextOverlayView extends View {
+
+    // Each detected result mapped to screen coordinates
+    private final List<TextBlock> blocks = new ArrayList<>();
+
+    // Image dimensions (used for coordinate scaling)
+    private int imageWidth = 1;
+    private int imageHeight = 1;
+
+    // Paints
+    private final Paint boxPaint;
+    private final Paint textBgPaint;
+    private final Paint textPaint;
+    private final Paint cornerPaint;
+
+    public static class TextBlock {
+        public RectF bounds;
+        public String text;
+        public TextBlock(RectF bounds, String text) {
+            this.bounds = bounds;
+            this.text = text;
+        }
+    }
+
+    public TextOverlayView(Context context, AttributeSet attrs) {
+        super(context, attrs);
+
+        // Bounding box stroke
+        boxPaint = new Paint();
+        boxPaint.setStyle(Paint.Style.STROKE);
+        boxPaint.setColor(Color.parseColor("#00E5FF")); // cyan
+        boxPaint.setStrokeWidth(3f);
+        boxPaint.setAntiAlias(true);
+
+        // Corner accent paint
+        cornerPaint = new Paint();
+        cornerPaint.setStyle(Paint.Style.STROKE);
+        cornerPaint.setColor(Color.parseColor("#00E5FF"));
+        cornerPaint.setStrokeWidth(6f);
+        cornerPaint.setStrokeCap(Paint.Cap.ROUND);
+        cornerPaint.setAntiAlias(true);
+
+        // Text background pill
+        textBgPaint = new Paint();
+        textBgPaint.setStyle(Paint.Style.FILL);
+        textBgPaint.setColor(Color.parseColor("#CC001F3F")); // dark blue 80% opacity
+        textBgPaint.setAntiAlias(true);
+
+        // Text label
+        textPaint = new Paint();
+        textPaint.setColor(Color.WHITE);
+        textPaint.setTextSize(32f);
+        textPaint.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
+        textPaint.setAntiAlias(true);
+    }
+
+    /**
+     * Called from MainActivity after ML Kit returns results.
+     * Pass the original image size so we can scale coordinates to screen.
+     */
+    public void setResults(Text mlKitResult, int imgWidth, int imgHeight) {
+        blocks.clear();
+        imageWidth = imgWidth;
+        imageHeight = imgHeight;
+
+        for (Text.TextBlock block : mlKitResult.getTextBlocks()) {
+            if (block.getBoundingBox() == null) continue;
+
+            Rect box = block.getBoundingBox();
+            // Scale from image coords → view coords (done in onDraw)
+            blocks.add(new TextBlock(
+                new RectF(box.left, box.top, box.right, box.bottom),
+                block.getText()
+            ));
+        }
+
+        invalidate(); // triggers onDraw
+    }
+
+    public void clear() {
+        blocks.clear();
+        invalidate();
+    }
+
+    @Override
+    protected void onDraw(Canvas canvas) {
+        super.onDraw(canvas);
+        if (blocks.isEmpty()) return;
+
+        float scaleX = (float) getWidth()  / imageWidth;
+        float scaleY = (float) getHeight() / imageHeight;
+
+        for (TextBlock block : blocks) {
+            // Scale bounding box to screen
+            RectF scaled = new RectF(
+                block.bounds.left   * scaleX,
+                block.bounds.top    * scaleY,
+                block.bounds.right  * scaleX,
+                block.bounds.bottom * scaleY
+            );
+
+            // Draw bounding box
+            canvas.drawRoundRect(scaled, 8f, 8f, boxPaint);
+
+            // Draw corner accents (AR style)
+            drawCornerAccents(canvas, scaled);
+
+            // Draw text label above the box
+            drawTextLabel(canvas, block.text, scaled);
+        }
+    }
+
+    /** Draws short L-shaped lines at each corner for that AR scanner look */
+    private void drawCornerAccents(Canvas canvas, RectF r) {
+        float len = 28f;
+
+        // Top-left
+        canvas.drawLine(r.left, r.top, r.left + len, r.top, cornerPaint);
+        canvas.drawLine(r.left, r.top, r.left, r.top + len, cornerPaint);
+
+        // Top-right
+        canvas.drawLine(r.right, r.top, r.right - len, r.top, cornerPaint);
+        canvas.drawLine(r.right, r.top, r.right, r.top + len, cornerPaint);
+
+        // Bottom-left
+        canvas.drawLine(r.left, r.bottom, r.left + len, r.bottom, cornerPaint);
+        canvas.drawLine(r.left, r.bottom, r.left, r.bottom - len, cornerPaint);
+
+        // Bottom-right
+        canvas.drawLine(r.right, r.bottom, r.right - len, r.bottom, cornerPaint);
+        canvas.drawLine(r.right, r.bottom, r.right, r.bottom - len, cornerPaint);
+    }
+
+    /** Draws a pill background + text label just above the bounding box */
+    private void drawTextLabel(Canvas canvas, String text, RectF box) {
+        // Truncate long text for the overlay label
+        String label = text.replace("\n", " ");
+        if (label.length() > 40) label = label.substring(0, 40) + "…";
+
+        float textWidth  = textPaint.measureText(label);
+        float textHeight = textPaint.getTextSize();
+        float padding    = 10f;
+        float radius     = 12f;
+
+        float bgLeft   = box.left;
+        float bgTop    = box.top - textHeight - padding * 2 - 4f;
+        float bgRight  = bgLeft + textWidth + padding * 2;
+        float bgBottom = box.top - 4f;
+
+        // Keep label within screen bounds
+        if (bgTop < 0) bgTop = box.bottom + 4f;
+        if (bgRight > getWidth()) {
+            bgLeft  = getWidth() - textWidth - padding * 2;
+            bgRight = getWidth();
+        }
+
+        RectF bgRect = new RectF(bgLeft, bgTop, bgRight, bgBottom);
+        canvas.drawRoundRect(bgRect, radius, radius, textBgPaint);
+        canvas.drawText(label, bgLeft + padding, bgBottom - padding, textPaint);
+    }
+}
+```
+
+---
+
+## `TextDetectionProcessor.java` — ML Kit wrapper
+```java
+package com.yourapp;
+
+import android.graphics.Bitmap;
+
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.Text;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+
+public class TextDetectionProcessor {
+
+    public interface ResultCallback {
+        void onSuccess(Text result, int imageWidth, int imageHeight);
+        void onFailure(Exception e);
+    }
+
+    private final TextRecognizer recognizer;
+
+    public TextDetectionProcessor() {
+        // Latin script — swap for ChineseTextRecognizerOptions etc. if needed
+        recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+    }
+
+    /** Run ML Kit on a captured bitmap. Callback fires on main thread. */
+    public void process(Bitmap bitmap, ResultCallback callback) {
+        InputImage image = InputImage.fromBitmap(bitmap, 0);
+
+        recognizer.process(image)
+            .addOnSuccessListener(result ->
+                callback.onSuccess(result, bitmap.getWidth(), bitmap.getHeight()))
+            .addOnFailureListener(callback::onFailure);
+    }
+
+    public void close() {
+        recognizer.close();
+    }
+}
+```
+
+---
+
+## `MainActivity.java` — Full wiring
+```java
+package com.yourapp;
+
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.Button;
+import android.widget.ImageView;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.core.*;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.camera.view.PreviewView;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.mlkit.vision.text.Text;
+
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class MainActivity extends AppCompatActivity {
+
+    private static final int CAMERA_PERMISSION_CODE = 100;
+
+    private PreviewView cameraPreview;
+    private ImageView frozenFrame;
+    private TextOverlayView textOverlay;
+    private TextView statusText;
+    private Button btnCapture, btnReset;
+
+    private ImageCapture imageCapture;
+    private TextDetectionProcessor detector;
+    private ExecutorService cameraExecutor;
+
+    private boolean isProcessing = false;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        cameraPreview = findViewById(R.id.camera_preview);
+        frozenFrame   = findViewById(R.id.frozen_frame);
+        textOverlay   = findViewById(R.id.text_overlay);
+        statusText    = findViewById(R.id.status_text);
+        btnCapture    = findViewById(R.id.btn_capture);
+        btnReset      = findViewById(R.id.btn_reset);
+
+        detector     = new TextDetectionProcessor();
+        cameraExecutor = Executors.newSingleThreadExecutor();
+
+        btnCapture.setOnClickListener(v -> captureAndDetect());
+        btnReset.setOnClickListener(v -> resetToLivePreview());
+
+        if (hasCameraPermission()) {
+            startCamera();
+        } else {
+            ActivityCompat.requestPermissions(this,
+                new String[]{Manifest.permission.CAMERA},
+                CAMERA_PERMISSION_CODE);
+        }
+    }
+
+    // ── Camera setup ───────────────────────────────────────────────────────
+
+    private void startCamera() {
+        ListenableFuture<ProcessCameraProvider> future =
+            ProcessCameraProvider.getInstance(this);
+
+        future.addListener(() -> {
+            try {
+                ProcessCameraProvider provider = future.get();
+
+                Preview preview = new Preview.Builder().build();
+                preview.setSurfaceProvider(cameraPreview.getSurfaceProvider());
+
+                imageCapture = new ImageCapture.Builder()
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .build();
+
+                provider.unbindAll();
+                provider.bindToLifecycle(this,
+                    androidx.camera.core.CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview,
+                    imageCapture);
+
+            } catch (ExecutionException | InterruptedException e) {
+                Toast.makeText(this, "Camera failed: " + e.getMessage(),
+                    Toast.LENGTH_SHORT).show();
+            }
+        }, ContextCompat.getMainExecutor(this));
+    }
+
+    // ── Capture + detect ───────────────────────────────────────────────────
+
+    private void captureAndDetect() {
+        if (isProcessing || imageCapture == null) return;
+        isProcessing = true;
+
+        btnCapture.setEnabled(false);
+        statusText.setText("⚡ Scanning…");
+
+        imageCapture.takePicture(cameraExecutor,
+            new ImageCapture.OnImageCapturedCallback() {
+
+                @Override
+                public void onCaptureSuccess(@NonNull ImageProxy imageProxy) {
+                    // Convert ImageProxy → Bitmap
+                    Bitmap bitmap = imageProxy.toBitmap();
+                    int rotation  = imageProxy.getImageInfo().getRotationDegrees();
+                    imageProxy.close();
+
+                    // Correct rotation
+                    Bitmap rotated = rotateBitmap(bitmap, rotation);
+
+                    // Show frozen frame while processing
+                    runOnUiThread(() -> {
+                        frozenFrame.setImageBitmap(rotated);
+                        frozenFrame.setVisibility(View.VISIBLE);
+                        cameraPreview.setVisibility(View.INVISIBLE);
+                    });
+
+                    // Run ML Kit
+                    detector.process(rotated, new TextDetectionProcessor.ResultCallback() {
+
+                        @Override
+                        public void onSuccess(Text result, int imgW, int imgH) {
+                            runOnUiThread(() -> {
+                                if (result.getTextBlocks().isEmpty()) {
+                                    statusText.setText("No text found. Try again.");
+                                    resetToLivePreview();
+                                } else {
+                                    // Draw overlay on frozen frame
+                                    textOverlay.setResults(result, imgW, imgH);
+                                    statusText.setText(
+                                        "Found " + result.getTextBlocks().size() +
+                                        " text block(s)");
+                                    btnReset.setVisibility(View.VISIBLE);
+                                    btnCapture.setVisibility(View.GONE);
+                                }
+                                isProcessing = false;
+                                btnCapture.setEnabled(true);
+                            });
+                        }
+
+                        @Override
+                        public void onFailure(Exception e) {
+                            runOnUiThread(() -> {
+                                statusText.setText("Detection failed: " + e.getMessage());
+                                resetToLivePreview();
+                                isProcessing = false;
+                                btnCapture.setEnabled(true);
+                            });
+                        }
+                    });
+                }
+
+                @Override
+                public void onError(@NonNull ImageCaptureException e) {
+                    runOnUiThread(() -> {
+                        statusText.setText("Capture error: " + e.getMessage());
+                        isProcessing = false;
+                        btnCapture.setEnabled(true);
+                    });
+                }
+            });
+    }
+
+    // ── Reset to live preview ──────────────────────────────────────────────
+
+    private void resetToLivePreview() {
+        textOverlay.clear();
+        frozenFrame.setVisibility(View.GONE);
+        frozenFrame.setImageBitmap(null);
+        cameraPreview.setVisibility(View.VISIBLE);
+        btnReset.setVisibility(View.GONE);
+        btnCapture.setVisibility(View.VISIBLE);
+        statusText.setText("Tap the button to scan text");
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    private Bitmap rotateBitmap(Bitmap src, int degrees) {
+        if (degrees == 0) return src;
+        android.graphics.Matrix matrix = new android.graphics.Matrix();
+        matrix.postRotate(degrees);
+        return Bitmap.createBitmap(src, 0, 0,
+            src.getWidth(), src.getHeight(), matrix, true);
+    }
+
+    private boolean hasCameraPermission() {
+        return ContextCompat.checkSelfPermission(this,
+            Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode,
+            @NonNull String[] permissions, @NonNull int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode == CAMERA_PERMISSION_CODE &&
+            results.length > 0 &&
+            results[0] == PackageManager.PERMISSION_GRANTED) {
+            startCamera();
+        } else {
+            Toast.makeText(this, "Camera permission required", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        cameraExecutor.shutdown();
+        detector.close();
+    }
+}
+```
+
+---
+
+## What each file does
+
+| File | Role |
+|---|---|
+| `TextDetectionProcessor.java` | Wraps ML Kit — takes a Bitmap, returns `Text` result |
+| `TextOverlayView.java` | Custom View — scales ML Kit bounding boxes to screen, draws AR-style labels |
+| `MainActivity.java` | CameraX setup, capture trigger, wires detector → overlay |
+| `activity_main.xml` | Preview + overlay stacked in a FrameLayout |
+
+---
+
+## Key things to know
+
+- **`CAPTURE_MODE_MINIMIZE_LATENCY`** on ImageCapture makes the shutter as fast as possible
+- The frozen frame is shown instantly while ML Kit processes in background — feels snappy
+- `TextOverlayView` scales coordinates from image space → screen space so labels land exactly on the text
+- Swap `TextRecognizerOptions.DEFAULT_OPTIONS` for `ChineseTextRecognizerOptions`, `DevanagariTextRecognizerOptions` etc. for other scripts — no other code changes needed
