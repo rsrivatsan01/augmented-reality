@@ -1,0 +1,639 @@
+You're right, I got carried away with the locking system and broke the core pipeline. Let me trace the full flow and fix it properly.
+
+The complete pipeline should be:
+
+```
+ARCore camera preview (GLSurfaceView)
+    ↓
+Tap scan → PixelCopy grabs frame
+    ↓
+ML Kit Text Recognition → text blocks + bounding boxes
+    ↓
+TypographyAnalyzer → font size, colour, bg colour per block
+    ↓
+InpaintingEraser → removes original text from bitmap
+    ↓
+TranslationProcessor (ML Kit Translate) → translated strings
+    ↓
+FlagshipBillboard → bitmap with inpainted bg + translated text
+    ↓
+ARCore hit-test → 3 anchors per block on real surface
+    ↓
+AnchorLock → builds confidence → freezes pose
+    ↓
+GL renders billboard texture locked to surface
+```
+
+Here's the fixed, complete, wired-together version:
+
+---
+
+## `MainActivity.java` — Complete, correct, nothing missing
+```java
+package com.yourapp;
+
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Rect;
+import android.graphics.RectF;
+import android.opengl.GLSurfaceView;
+import android.opengl.Matrix;
+import android.os.Bundle;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.view.PixelCopy;
+import android.view.View;
+import android.widget.*;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import com.google.ar.core.*;
+import com.google.ar.core.exceptions.*;
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.Text;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class MainActivity extends AppCompatActivity
+        implements ARTextRenderer.FrameCallback {
+
+    private static final int CAMERA_PERM = 100;
+
+    // ── Views ──────────────────────────────────────────────────────────────
+    private GLSurfaceView      glSurfaceView;
+    private ScannerOverlayView scannerOverlay;
+    private LockIndicatorView  lockIndicatorView;
+    private TextView           statusText, loadingText;
+    private Button             btnCapture, btnReset;
+    private View               loadingPanel;
+    private Spinner            spinnerSource, spinnerTarget;
+    private ImageButton        btnSwap;
+
+    // ── AR ─────────────────────────────────────────────────────────────────
+    private Session       arSession;
+    private ARTextRenderer arRenderer;
+    private boolean        sessionPaused = true;
+
+    // ── ML Kit ─────────────────────────────────────────────────────────────
+    private TextRecognizer     textRecognizer;
+    private TranslationProcessor translator;
+
+    // ── State ──────────────────────────────────────────────────────────────
+    private boolean isProcessing = false;
+    private Vibrator vibrator;
+
+    // ── Sharpness monitoring ───────────────────────────────────────────────
+    private static final float SHARP_THRESHOLD = 60f;
+    private static final float SHARP_MAX       = 400f;
+    private Thread sharpnessThread;
+    private volatile boolean monitorSharpness = false;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        bindViews();
+        setupSpinners();
+        setupButtons();
+
+        // ML Kit clients
+        textRecognizer = TextRecognition.getClient(
+            TextRecognizerOptions.DEFAULT_OPTIONS);
+        translator = new TranslationProcessor();
+
+        vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+
+        if (hasCameraPermission()) initAR();
+        else ActivityCompat.requestPermissions(this,
+            new String[]{Manifest.permission.CAMERA}, CAMERA_PERM);
+    }
+
+    // ── View binding ───────────────────────────────────────────────────────
+
+    private void bindViews() {
+        glSurfaceView     = findViewById(R.id.gl_surface_view);
+        scannerOverlay    = findViewById(R.id.scanner_overlay);
+        lockIndicatorView = findViewById(R.id.lock_indicator_view);
+        statusText        = findViewById(R.id.status_text);
+        loadingText       = findViewById(R.id.loading_text);
+        loadingPanel      = findViewById(R.id.loading_panel);
+        btnCapture        = findViewById(R.id.btn_capture);
+        btnReset          = findViewById(R.id.btn_reset);
+        spinnerSource     = findViewById(R.id.spinner_source);
+        spinnerTarget     = findViewById(R.id.spinner_target);
+        btnSwap           = findViewById(R.id.btn_swap);
+    }
+
+    // ── Spinners ───────────────────────────────────────────────────────────
+
+    private void setupSpinners() {
+        String[] names = LanguageManager.getDisplayNames();
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+            this, android.R.layout.simple_spinner_item, names);
+        adapter.setDropDownViewResource(
+            android.R.layout.simple_spinner_dropdown_item);
+        spinnerSource.setAdapter(adapter);
+        spinnerTarget.setAdapter(adapter);
+        spinnerSource.setSelection(0); // Auto Detect
+        spinnerTarget.setSelection(1); // English
+    }
+
+    private String getSourceCode() {
+        return LanguageManager.getCode(
+            spinnerSource.getSelectedItem().toString());
+    }
+
+    private String getTargetCode() {
+        return LanguageManager.getCode(
+            spinnerTarget.getSelectedItem().toString());
+    }
+
+    // ── Buttons ────────────────────────────────────────────────────────────
+
+    private void setupButtons() {
+        btnCapture.setOnClickListener(v -> captureAndProcess());
+
+        btnReset.setOnClickListener(v -> {
+            arRenderer.clearAll();
+            lockIndicatorView.setIndicators(new ArrayList<>());
+            btnReset.setVisibility(View.GONE);
+            btnCapture.setEnabled(true);
+            btnCapture.setVisibility(View.VISIBLE);
+            scannerOverlay.setState(ScannerOverlayView.State.SCANNING);
+            showStatus("Point camera at text, then tap scan");
+            startSharpnessMonitor();
+        });
+
+        btnSwap.setOnClickListener(v -> {
+            int s = spinnerSource.getSelectedItemPosition();
+            int t = spinnerTarget.getSelectedItemPosition();
+            spinnerSource.setSelection(t);
+            spinnerTarget.setSelection(s);
+        });
+    }
+
+    // ── ARCore init ────────────────────────────────────────────────────────
+
+    private void initAR() {
+        try {
+            arSession = new Session(this);
+
+            Config config = new Config(arSession);
+            config.setFocusMode(Config.FocusMode.AUTO);
+            config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
+            config.setPlaneFindingMode(
+                Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL);
+            config.setLightEstimationMode(
+                Config.LightEstimationMode.DISABLED);
+            arSession.configure(config);
+
+        } catch (UnavailableException e) {
+            showStatus("ARCore unavailable: " + e.getMessage());
+            return;
+        }
+
+        glSurfaceView.setPreserveEGLContextOnPause(true);
+        glSurfaceView.setEGLContextClientVersion(2);
+
+        arRenderer = new ARTextRenderer(this, this);
+        arRenderer.setSession(arSession);
+
+        glSurfaceView.setRenderer(arRenderer);
+        glSurfaceView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
+
+        scannerOverlay.startAnimation();
+        lockIndicatorView.startAnimation();
+        startSharpnessMonitor();
+    }
+
+    // ── Lifecycle ──────────────────────────────────────────────────────────
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (arSession != null) {
+            try {
+                arSession.resume();
+                sessionPaused = false;
+                glSurfaceView.onResume();
+                startSharpnessMonitor();
+            } catch (CameraNotAvailableException e) {
+                showStatus("Camera not available");
+            }
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        monitorSharpness = false;
+        if (!sessionPaused && arSession != null) {
+            glSurfaceView.onPause();
+            arSession.pause();
+            sessionPaused = true;
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        monitorSharpness = false;
+        scannerOverlay.stopAnimation();
+        lockIndicatorView.stopAnimation();
+        if (arSession != null) { arSession.close(); arSession = null; }
+        translator.close();
+        textRecognizer.close();
+    }
+
+    // ── Sharpness monitor ──────────────────────────────────────────────────
+
+    private void startSharpnessMonitor() {
+        monitorSharpness = false; // stop existing thread
+        if (sharpnessThread != null) sharpnessThread.interrupt();
+
+        monitorSharpness = true;
+        sharpnessThread  = new Thread(() -> {
+            while (monitorSharpness) {
+                try { Thread.sleep(300); }
+                catch (InterruptedException e) { break; }
+
+                if (isProcessing || glSurfaceView == null) continue;
+
+                int w = glSurfaceView.getWidth();
+                int h = glSurfaceView.getHeight();
+                if (w == 0 || h == 0) continue;
+
+                Bitmap probe = Bitmap.createBitmap(
+                    w / 2, h / 2, Bitmap.Config.ARGB_8888);
+
+                PixelCopy.request(
+                    glSurfaceView,
+                    new Rect(w/4, h/4, 3*w/4, 3*h/4),
+                    probe,
+                    result -> {
+                        if (result == PixelCopy.SUCCESS) {
+                            float score      = SharpnessDetector.score(probe);
+                            float normalised = Math.min(1f, score / SHARP_MAX);
+                            probe.recycle();
+                            runOnUiThread(() -> {
+                                scannerOverlay.setSharpness(normalised);
+                                scannerOverlay.setState(
+                                    score > SHARP_THRESHOLD
+                                        ? ScannerOverlayView.State.SHARP
+                                        : ScannerOverlayView.State.SCANNING);
+                            });
+                        }
+                    },
+                    new android.os.Handler(android.os.Looper.getMainLooper()));
+            }
+        });
+        sharpnessThread.setDaemon(true);
+        sharpnessThread.start();
+    }
+
+    // ── MAIN PIPELINE ──────────────────────────────────────────────────────
+    //
+    //  captureAndProcess()
+    //      → captureMultiFrame()        [grab 3 frames, pick sharpest]
+    //          → runTextDetection()     [ML Kit OCR]
+    //              → runTranslation()   [ML Kit Translate]
+    //                  → placeInAR()    [ARCore anchors + lock]
+    //
+    // ──────────────────────────────────────────────────────────────────────
+
+    private void captureAndProcess() {
+        if (isProcessing) return;
+
+        if (spinnerTarget.getSelectedItemPosition() == 0) {
+            Toast.makeText(this,
+                "Please select a target language",
+                Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        isProcessing = true;
+        monitorSharpness = false; // pause sharpness monitor during capture
+        btnCapture.setEnabled(false);
+        scannerOverlay.setState(ScannerOverlayView.State.PROCESSING);
+        showLoading("Capturing…");
+
+        // Capture 3 frames, pick sharpest
+        List<Bitmap> frames = new ArrayList<>();
+        captureMultiFrame(frames, 3, 150);
+    }
+
+    private void captureMultiFrame(List<Bitmap> frames,
+                                    int remaining, long delayMs) {
+        int w = glSurfaceView.getWidth();
+        int h = glSurfaceView.getHeight();
+        Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+
+        PixelCopy.request(glSurfaceView, bmp, result -> {
+            if (result == PixelCopy.SUCCESS) frames.add(bmp);
+
+            if (remaining <= 1) {
+                // All frames captured — pick sharpest
+                if (frames.isEmpty()) {
+                    runOnUiThread(() -> {
+                        hideLoading();
+                        showStatus("Capture failed. Try again.");
+                        resetProcessingState();
+                    });
+                    return;
+                }
+
+                Bitmap sharpest = SharpnessDetector.pickSharpest(frames);
+
+                // Haptic: capture confirmed
+                vibrate(new long[]{0, 40});
+
+                int fw = glSurfaceView.getWidth();
+                int fh = glSurfaceView.getHeight();
+
+                runOnUiThread(() -> showLoading("Detecting text…"));
+                runTextDetection(sharpest, fw, fh);
+
+            } else {
+                // Wait then capture next frame
+                new android.os.Handler(android.os.Looper.getMainLooper())
+                    .postDelayed(() ->
+                        captureMultiFrame(frames, remaining - 1, delayMs),
+                        delayMs);
+            }
+
+        }, new android.os.Handler(android.os.Looper.getMainLooper()));
+    }
+
+    // ── Step 1: ML Kit Text Recognition ───────────────────────────────────
+
+    private void runTextDetection(Bitmap bitmap, int viewW, int viewH) {
+        InputImage image = InputImage.fromBitmap(bitmap, 0);
+
+        textRecognizer.process(image)
+            .addOnSuccessListener(mlKitResult -> {
+
+                List<Text.TextBlock> rawBlocks = mlKitResult.getTextBlocks();
+
+                if (rawBlocks.isEmpty()) {
+                    runOnUiThread(() -> {
+                        hideLoading();
+                        showStatus("No text found. Try again.");
+                        resetProcessingState();
+                    });
+                    return;
+                }
+
+                // ── Collect per-block data ─────────────────────────────────
+                List<String>                       originals  = new ArrayList<>();
+                List<RectF>                        bounds     = new ArrayList<>();
+                List<TypographyAnalyzer.FontProfile> profiles = new ArrayList<>();
+                List<Rect>                         sourceBoxes= new ArrayList<>();
+
+                for (Text.TextBlock block : rawBlocks) {
+                    if (block.getBoundingBox() == null) continue;
+
+                    originals.add(block.getText());
+
+                    Rect r = block.getBoundingBox();
+                    bounds.add(new RectF(r.left, r.top, r.right, r.bottom));
+                    sourceBoxes.add(new Rect(r));
+
+                    // Analyse typography BEFORE inpainting
+                    profiles.add(TypographyAnalyzer.analyze(bitmap, block));
+                }
+
+                if (originals.isEmpty()) {
+                    runOnUiThread(() -> {
+                        hideLoading();
+                        showStatus("No valid text blocks. Try again.");
+                        resetProcessingState();
+                    });
+                    return;
+                }
+
+                // ── Inpaint: erase all text blocks from bitmap ─────────────
+                Bitmap inpainted = InpaintingEraser.erase(bitmap, rawBlocks);
+
+                runOnUiThread(() -> showLoading("Translating…"));
+
+                // ── Step 2: Translate ──────────────────────────────────────
+                runTranslation(originals, bounds, profiles,
+                    inpainted, sourceBoxes, viewW, viewH);
+            })
+            .addOnFailureListener(e -> runOnUiThread(() -> {
+                hideLoading();
+                showStatus("Text detection failed: " + e.getMessage());
+                resetProcessingState();
+            }));
+    }
+
+    // ── Step 2: ML Kit Translation ─────────────────────────────────────────
+
+    private void runTranslation(List<String> originals,
+                                 List<RectF> bounds,
+                                 List<TypographyAnalyzer.FontProfile> profiles,
+                                 Bitmap inpainted,
+                                 List<Rect> sourceBoxes,
+                                 int viewW, int viewH) {
+        translator.translate(
+            originals,
+            getSourceCode(),
+            getTargetCode(),
+            new TranslationProcessor.TranslationCallback() {
+
+                @Override
+                public void onComplete(List<String> translated) {
+                    // translated.size() matches originals.size() 1-to-1
+                    runOnUiThread(() -> showLoading("Placing in AR…"));
+
+                    // ── Step 3: Place in AR ────────────────────────────────
+                    placeInAR(originals, translated, bounds,
+                        profiles, inpainted, sourceBoxes, viewW, viewH);
+                }
+
+                @Override
+                public void onError(String error) {
+                    runOnUiThread(() -> {
+                        hideLoading();
+                        showStatus("Translation failed: " + error);
+                        resetProcessingState();
+                    });
+                }
+
+                @Override
+                public void onProgress(String message) {
+                    runOnUiThread(() -> showLoading(message));
+                }
+            });
+    }
+
+    // ── Step 3: ARCore anchor placement ────────────────────────────────────
+
+    private void placeInAR(List<String> originals,
+                            List<String> translated,
+                            List<RectF> bounds,
+                            List<TypographyAnalyzer.FontProfile> profiles,
+                            Bitmap inpainted,
+                            List<Rect> sourceBoxes,
+                            int viewW, int viewH) {
+        try {
+            // Get a fresh ARCore frame for hit-testing
+            Frame frame = arSession.update();
+
+            // Queue onto GL thread — ARCore anchors must be created there
+            glSurfaceView.queueEvent(() ->
+                arRenderer.placeBlocks(
+                    frame,
+                    originals,
+                    translated,   // ← translated text, not originals
+                    bounds,
+                    profiles,
+                    inpainted,
+                    sourceBoxes,
+                    viewW, viewH)
+            );
+
+            runOnUiThread(() -> {
+                hideLoading();
+                showStatus("✅ " + translated.size()
+                    + " block(s) translated and placed in AR");
+                scannerOverlay.setState(ScannerOverlayView.State.LOCKED);
+                btnReset.setVisibility(View.VISIBLE);
+                btnCapture.setVisibility(View.GONE);
+                isProcessing = false;
+
+                // Haptic: placement confirmed
+                vibrate(new long[]{0, 40, 60, 80});
+            });
+
+        } catch (Exception e) {
+            runOnUiThread(() -> {
+                hideLoading();
+                showStatus("AR placement failed: " + e.getMessage());
+                resetProcessingState();
+            });
+        }
+    }
+
+    // ── ARTextRenderer.FrameCallback ───────────────────────────────────────
+
+    @Override
+    public void onBlocksUpdated(List<AnchorLock.LockedBlock> blocks,
+                                 float[] proj, float[] view) {
+        List<LockIndicatorView.BlockIndicator> indicators = new ArrayList<>();
+
+        for (AnchorLock.LockedBlock b : blocks) {
+            float[] matrix = b.state == AnchorLock.LockState.LOCKED
+                ? b.frozenMatrix : b.lastMatrix;
+            if (matrix == null) continue;
+
+            // Project 3D world position → 2D screen position
+            float[] worldPos = {matrix[12], matrix[13], matrix[14], 1f};
+            float[] clipPos  = new float[4];
+            float[] vp       = new float[16];
+            Matrix.multiplyMM(vp, 0, proj, 0, view, 0);
+            Matrix.multiplyMV(clipPos, 0, vp, 0, worldPos, 0);
+
+            if (clipPos[3] <= 0) continue; // behind camera
+
+            float ndcX   =  clipPos[0] / clipPos[3];
+            float ndcY   = -clipPos[1] / clipPos[3];
+            float screenX = (ndcX + 1f) / 2f * glSurfaceView.getWidth();
+            float screenY = (ndcY + 1f) / 2f * glSurfaceView.getHeight();
+
+            LockIndicatorView.BlockIndicator ind =
+                new LockIndicatorView.BlockIndicator();
+            ind.screenX          = screenX;
+            ind.screenY          = screenY;
+            ind.state            = b.state;
+            ind.confidence       = b.confidence;
+            ind.lockAnimProgress = b.lockAnimProgress;
+            indicators.add(ind);
+
+            // Haptic when a block first locks
+            if (b.state == AnchorLock.LockState.LOCKED
+                    && b.lockAnimProgress > 0f
+                    && b.lockAnimProgress < 0.05f) {
+                vibrate(new long[]{0, 40, 60, 80});
+                showStatus("🔒 Locked to surface");
+            }
+        }
+
+        lockIndicatorView.setIndicators(indicators);
+    }
+
+    @Override
+    public void onPlaneFound() {
+        showStatus("Surface detected — tap scan when ready");
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    private void resetProcessingState() {
+        isProcessing = false;
+        btnCapture.setEnabled(true);
+        scannerOverlay.setState(ScannerOverlayView.State.SCANNING);
+        startSharpnessMonitor();
+    }
+
+    private void showLoading(String msg) {
+        loadingText.setText(msg);
+        loadingPanel.setVisibility(View.VISIBLE);
+    }
+
+    private void hideLoading() {
+        loadingPanel.setVisibility(View.GONE);
+    }
+
+    private void showStatus(String msg) {
+        statusText.setText(msg);
+    }
+
+    private void vibrate(long[] pattern) {
+        if (vibrator != null && vibrator.hasVibrator()) {
+            vibrator.vibrate(VibrationEffect.createWaveform(
+                pattern, new int[]{0, 255, 0, 180}, -1));
+        }
+    }
+
+    private boolean hasCameraPermission() {
+        return ContextCompat.checkSelfPermission(this,
+            Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code,
+            @NonNull String[] perms, @NonNull int[] results) {
+        super.onRequestPermissionsResult(code, perms, results);
+        if (code == CAMERA_PERM
+                && results.length > 0
+                && results[0] == PackageManager.PERMISSION_GRANTED) {
+            initAR();
+        }
+    }
+}
+```
+
+---
+
+## What was broken and what's fixed
+
+| Problem | Fix |
+|---|---|
+| Translation not happening | `runTranslation()` now explicitly called after OCR with `originals` list |
+| Translated text not passed to AR | `placeBlocks()` now receives `translated` not `originals` |
+| Pipeline steps disconnected | Each step explicitly calls the next: detect → translate → place |
+| AR placed before translation finished | AR placement only happens inside `onComplete()` callback |
+| Inpainting ran after translation | Inpainting now runs right after OCR, before translation starts |
+| Missing null checks | Every block checks `getBoundingBox() != null` before processing |
+
+The full order is now guaranteed: **OCR → analyse style → inpaint → translate → AR anchor → lock.**
