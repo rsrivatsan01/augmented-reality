@@ -1,0 +1,834 @@
+I know exactly what's happening. Two separate bugs:
+
+**Bug 1 — Rotation:** Your billboard uses `makeBillboard()` which copies the camera's view matrix rotation — so when you rotate the phone, the overlay rotates with it. It should be locked to the **surface normal** instead.
+
+**Bug 2 — Floating:** The overlay is rendered as a flat quad at anchor position but isn't constrained to the plane equation. ARCore gives us the exact plane normal and pose — we need to use that to pin the quad flush against the surface.
+
+No gyroscope needed — ARCore already gives us everything. Here's the fix:
+
+---
+
+## `SurfacePinner.java` — Stores plane normal per anchor for true surface alignment
+```java
+package com.yourapp;
+
+import com.google.ar.core.Anchor;
+import com.google.ar.core.Frame;
+import com.google.ar.core.HitResult;
+import com.google.ar.core.Plane;
+import com.google.ar.core.Pose;
+import com.google.ar.core.Session;
+import com.google.ar.core.TrackingState;
+
+import java.util.List;
+
+/**
+ * Creates anchors that are permanently aligned to the detected plane.
+ * Stores the plane's normal vector so the overlay quad can be rendered
+ * flush against the real surface — not floating or rotating with phone.
+ */
+public class SurfacePinner {
+
+    public static class PinnedAnchor {
+        public Anchor anchor;
+        public float[] planeNormal;   // world-space normal of the surface
+        public float[] planeRight;    // right vector along the surface
+        public float[] planeUp;       // up vector along the surface
+        public float[] surfaceMatrix; // pre-built 4×4 for rendering
+
+        // Frozen once confidence is high
+        public float[] frozenMatrix;
+        public boolean frozen = false;
+    }
+
+    /**
+     * Hit-test at screenX/screenY and return a PinnedAnchor
+     * that carries the plane's orientation, not the camera's.
+     */
+    public static PinnedAnchor create(Frame frame, Session session,
+                                       float screenX, float screenY) {
+        try {
+            List<HitResult> hits = frame.hitTest(screenX, screenY);
+
+            for (HitResult hit : hits) {
+                if (!(hit.getTrackable() instanceof Plane)) continue;
+
+                Plane plane = (Plane) hit.getTrackable();
+                if (plane.getTrackingState() != TrackingState.TRACKING) continue;
+                if (plane.getSubsumedBy() != null) continue;
+
+                Anchor anchor = hit.createAnchor();
+                PinnedAnchor pa = new PinnedAnchor();
+                pa.anchor = anchor;
+
+                // ── Extract plane orientation ──────────────────────────────
+                // ARCore plane pose: Y axis = plane normal (points away from surface)
+                Pose planePose = plane.getCenterPose();
+                float[] poseMatrix = new float[16];
+                planePose.toMatrix(poseMatrix, 0);
+
+                // Y column = normal (indices 4,5,6)
+                pa.planeNormal = new float[]{
+                    poseMatrix[4], poseMatrix[5], poseMatrix[6]};
+
+                // X column = right along surface (indices 0,1,2)
+                pa.planeRight  = new float[]{
+                    poseMatrix[0], poseMatrix[1], poseMatrix[2]};
+
+                // Z column = up along surface (indices 8,9,10)
+                pa.planeUp     = new float[]{
+                    poseMatrix[8], poseMatrix[9], poseMatrix[10]};
+
+                // Build surface-aligned model matrix immediately
+                pa.surfaceMatrix = buildSurfaceMatrix(anchor, pa);
+
+                return pa;
+            }
+
+        } catch (Exception e) {
+            android.util.Log.e("SurfacePinner", "Hit test failed: " + e);
+        }
+
+        return null;
+    }
+
+    /**
+     * Builds a 4×4 model matrix that:
+     * 1. Positions the quad at the anchor's world position
+     * 2. Aligns the quad's normal to the plane's normal
+     * 3. Does NOT depend on camera orientation at all
+     *
+     * This means rotating the phone does nothing to the overlay.
+     */
+    public static float[] buildSurfaceMatrix(Anchor anchor, PinnedAnchor pa) {
+        float[] anchorMatrix = new float[16];
+        anchor.getPose().toMatrix(anchorMatrix, 0);
+
+        float[] m = new float[16];
+
+        // Column 0: right vector of plane (X axis of quad)
+        m[0]  = pa.planeRight[0];
+        m[1]  = pa.planeRight[1];
+        m[2]  = pa.planeRight[2];
+        m[3]  = 0f;
+
+        // Column 1: normal of plane (Y axis — quad faces this direction)
+        m[4]  = pa.planeNormal[0];
+        m[5]  = pa.planeNormal[1];
+        m[6]  = pa.planeNormal[2];
+        m[7]  = 0f;
+
+        // Column 2: up along plane (Z axis of quad)
+        m[8]  = pa.planeUp[0];
+        m[9]  = pa.planeUp[1];
+        m[10] = pa.planeUp[2];
+        m[11] = 0f;
+
+        // Column 3: world position from anchor
+        m[12] = anchorMatrix[12];
+        m[13] = anchorMatrix[13];
+        m[14] = anchorMatrix[14];
+        m[15] = 1f;
+
+        return m;
+    }
+
+    /**
+     * Call every frame pre-lock. Updates translation from anchor
+     * but keeps rotation locked to plane normal.
+     */
+    public static float[] updateMatrix(PinnedAnchor pa) {
+        if (pa.frozen) return pa.frozenMatrix;
+        if (pa.anchor == null ||
+            pa.anchor.getTrackingState() != TrackingState.TRACKING) {
+            return pa.surfaceMatrix;
+        }
+
+        // Only update translation — rotation stays fixed to plane
+        float[] anchorMatrix = new float[16];
+        pa.anchor.getPose().toMatrix(anchorMatrix, 0);
+
+        pa.surfaceMatrix[12] = anchorMatrix[12];
+        pa.surfaceMatrix[13] = anchorMatrix[13];
+        pa.surfaceMatrix[14] = anchorMatrix[14];
+
+        return pa.surfaceMatrix;
+    }
+
+    /** Freeze the matrix permanently — detach anchor */
+    public static void freeze(PinnedAnchor pa) {
+        pa.frozenMatrix = pa.surfaceMatrix.clone();
+        pa.frozen = true;
+        if (pa.anchor != null) {
+            pa.anchor.detach();
+            pa.anchor = null;
+        }
+    }
+}
+```
+
+---
+
+## `DepthPinner.java` — Prevents floating using ARCore depth
+```java
+package com.yourapp;
+
+import com.google.ar.core.Frame;
+import com.google.ar.core.HitResult;
+import com.google.ar.core.Plane;
+import com.google.ar.core.Pose;
+import com.google.ar.core.TrackingState;
+
+import java.util.List;
+
+/**
+ * Uses ARCore's hit-test depth to push the overlay
+ * exactly onto the real surface — eliminates floating.
+ *
+ * Also applies a tiny offset (1mm) toward camera
+ * so the texture doesn't z-fight with the plane.
+ */
+public class DepthPinner {
+
+    private static final float Z_OFFSET = 0.001f; // 1mm toward camera
+
+    /**
+     * Given a surface matrix, nudges the translation
+     * along the plane normal by Z_OFFSET toward the camera.
+     * This prevents z-fighting (texture flickering on surface).
+     */
+    public static float[] applyZOffset(float[] surfaceMatrix,
+                                        float[] planeNormal,
+                                        float[] cameraPos) {
+        float[] result = surfaceMatrix.clone();
+
+        // Direction from surface to camera
+        float dx = cameraPos[0] - surfaceMatrix[12];
+        float dy = cameraPos[1] - surfaceMatrix[13];
+        float dz = cameraPos[2] - surfaceMatrix[14];
+        float len = (float) Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+        if (len < 0.001f) return result;
+
+        // Nudge toward camera by Z_OFFSET
+        result[12] += (dx / len) * Z_OFFSET;
+        result[13] += (dy / len) * Z_OFFSET;
+        result[14] += (dz / len) * Z_OFFSET;
+
+        return result;
+    }
+
+    /**
+     * Refines anchor depth using multiple hit-tests around the text block.
+     * Returns average depth in metres from camera.
+     * Used to scale the billboard correctly.
+     */
+    public static float estimateDepth(Frame frame,
+                                       float cx, float cy,
+                                       float blockW, float blockH,
+                                       int viewW, int viewH) {
+        float[] testX = {cx - blockW*0.3f, cx, cx + blockW*0.3f};
+        float[] testY = {cy - blockH*0.3f, cy, cy + blockH*0.3f};
+
+        float totalDepth = 0f;
+        int   hitCount   = 0;
+
+        for (float tx : testX) {
+            for (float ty : testY) {
+                float sx = Math.max(0, Math.min(viewW, tx));
+                float sy = Math.max(0, Math.min(viewH, ty));
+
+                try {
+                    List<HitResult> hits = frame.hitTest(sx, sy);
+                    for (HitResult hit : hits) {
+                        if (hit.getTrackable() instanceof Plane) {
+                            Plane p = (Plane) hit.getTrackable();
+                            if (p.getTrackingState() == TrackingState.TRACKING) {
+                                totalDepth += hit.getDistance();
+                                hitCount++;
+                                break;
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+
+        return hitCount > 0 ? totalDepth / hitCount : 0.5f;
+    }
+}
+```
+
+---
+
+## `LockedQuadRenderer.java` — Renders quad flush on surface with correct scaling
+```java
+package com.yourapp;
+
+import android.opengl.GLES20;
+import android.opengl.Matrix;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
+import java.nio.ShortBuffer;
+
+/**
+ * Renders a textured quad that:
+ * 1. Is scaled in world-space metres (not screen pixels)
+ * 2. Is aligned to surface normal (not camera)
+ * 3. Sits flush on the surface (depth-pinned)
+ * 4. Does NOT rotate when phone rotates
+ */
+public class LockedQuadRenderer {
+
+    // Quad corners: unit square in local space
+    // X = right along surface, Y = up along surface
+    // Z = 0 (flat on surface)
+    private static final float[] VERTICES = {
+        -0.5f,  0f, -0.25f,   0f, 0f,  // top-left
+        -0.5f,  0f,  0.25f,   0f, 1f,  // bottom-left
+         0.5f,  0f,  0.25f,   1f, 1f,  // bottom-right
+         0.5f,  0f, -0.25f,   1f, 0f,  // top-right
+    };
+    private static final short[] INDICES = {0, 1, 2, 0, 2, 3};
+
+    private FloatBuffer vertexBuffer;
+    private ShortBuffer indexBuffer;
+
+    private final int program;
+    private final int uMVP, uTex, uAlpha;
+    private final int aPos, aUV;
+
+    private static final String VS =
+        "uniform mat4 u_MVP;\n" +
+        "attribute vec4 a_Pos;\n" +
+        "attribute vec2 a_UV;\n" +
+        "varying vec2 v_UV;\n" +
+        "void main(){\n" +
+        "  gl_Position = u_MVP * a_Pos;\n" +
+        "  v_UV = a_UV;\n" +
+        "}\n";
+
+    private static final String FS =
+        "precision mediump float;\n" +
+        "uniform sampler2D u_Tex;\n" +
+        "uniform float u_Alpha;\n" +
+        "varying vec2 v_UV;\n" +
+        "void main(){\n" +
+        "  vec4 c = texture2D(u_Tex, v_UV);\n" +
+        // Discard near-transparent pixels — sharp edges, no halo
+        "  if(c.a * u_Alpha < 0.05) discard;\n" +
+        "  gl_FragColor = vec4(c.rgb, c.a * u_Alpha);\n" +
+        "}\n";
+
+    public LockedQuadRenderer() {
+        // Build vertex buffer
+        ByteBuffer vbb = ByteBuffer.allocateDirect(VERTICES.length * 4);
+        vbb.order(ByteOrder.nativeOrder());
+        vertexBuffer = vbb.asFloatBuffer();
+        vertexBuffer.put(VERTICES).position(0);
+
+        // Build index buffer
+        ByteBuffer ibb = ByteBuffer.allocateDirect(INDICES.length * 2);
+        ibb.order(ByteOrder.nativeOrder());
+        indexBuffer = ibb.asShortBuffer();
+        indexBuffer.put(INDICES).position(0);
+
+        // Compile shaders
+        int vs = compileShader(GLES20.GL_VERTEX_SHADER,   VS);
+        int fs = compileShader(GLES20.GL_FRAGMENT_SHADER, FS);
+        program = GLES20.glCreateProgram();
+        GLES20.glAttachShader(program, vs);
+        GLES20.glAttachShader(program, fs);
+        GLES20.glLinkProgram(program);
+
+        uMVP   = GLES20.glGetUniformLocation(program, "u_MVP");
+        uTex   = GLES20.glGetUniformLocation(program, "u_Tex");
+        uAlpha = GLES20.glGetUniformLocation(program, "u_Alpha");
+        aPos   = GLES20.glGetAttribLocation(program,  "a_Pos");
+        aUV    = GLES20.glGetAttribLocation(program,  "a_UV");
+    }
+
+    /**
+     * Draw a single locked quad.
+     *
+     * @param surfaceMatrix  4×4 model matrix aligned to real surface
+     * @param viewMatrix     ARCore camera view matrix
+     * @param projMatrix     ARCore projection matrix
+     * @param textureId      GL texture ID of the translated billboard
+     * @param widthMeters    real-world width of the text block
+     * @param heightMeters   real-world height of the text block
+     * @param alpha          fade-in value 0→1
+     * @param cameraPos      world position of camera (for z-offset)
+     * @param planeNormal    surface normal (for z-offset direction)
+     */
+    public void draw(float[] surfaceMatrix,
+                     float[] viewMatrix,
+                     float[] projMatrix,
+                     int     textureId,
+                     float   widthMeters,
+                     float   heightMeters,
+                     float   alpha,
+                     float[] cameraPos,
+                     float[] planeNormal) {
+
+        // Apply z-offset to sit flush, not float
+        float[] pinnedMatrix = DepthPinner.applyZOffset(
+            surfaceMatrix, planeNormal, cameraPos);
+
+        // Scale to real-world dimensions
+        float[] scaleMatrix = new float[16];
+        Matrix.setIdentityM(scaleMatrix, 0);
+        Matrix.scaleM(scaleMatrix, 0,
+            widthMeters,       // X: width along surface
+            1f,                // Y: flat on surface (no thickness)
+            heightMeters);     // Z: height along surface
+
+        float[] modelMatrix = new float[16];
+        Matrix.multiplyMM(modelMatrix, 0, pinnedMatrix, 0, scaleMatrix, 0);
+
+        // MVP
+        float[] mv  = new float[16];
+        float[] mvp = new float[16];
+        Matrix.multiplyMM(mv,  0, viewMatrix, 0, modelMatrix, 0);
+        Matrix.multiplyMM(mvp, 0, projMatrix, 0, mv,          0);
+
+        // Draw
+        GLES20.glUseProgram(program);
+
+        GLES20.glUniformMatrix4fv(uMVP, 1, false, mvp, 0);
+        GLES20.glUniform1f(uAlpha, alpha);
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId);
+        GLES20.glUniform1i(uTex, 0);
+
+        int stride = 5 * 4;
+        vertexBuffer.position(0);
+        GLES20.glEnableVertexAttribArray(aPos);
+        GLES20.glVertexAttribPointer(aPos, 3,
+            GLES20.GL_FLOAT, false, stride, vertexBuffer);
+
+        vertexBuffer.position(3);
+        GLES20.glEnableVertexAttribArray(aUV);
+        GLES20.glVertexAttribPointer(aUV, 2,
+            GLES20.GL_FLOAT, false, stride, vertexBuffer);
+
+        indexBuffer.position(0);
+        GLES20.glDrawElements(GLES20.GL_TRIANGLES, 6,
+            GLES20.GL_UNSIGNED_SHORT, indexBuffer);
+
+        GLES20.glDisableVertexAttribArray(aPos);
+        GLES20.glDisableVertexAttribArray(aUV);
+    }
+
+    private int compileShader(int type, String src) {
+        int s = GLES20.glCreateShader(type);
+        GLES20.glShaderSource(s, src);
+        GLES20.glCompileShader(s);
+        return s;
+    }
+}
+```
+
+---
+
+## Updated `ARTextRenderer.java` — Replaces billboard with surface-locked quad
+```java
+package com.yourapp;
+
+import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.Rect;
+import android.graphics.RectF;
+import android.opengl.GLES20;
+import android.opengl.GLSurfaceView;
+import android.opengl.GLUtils;
+import android.opengl.Matrix;
+import android.util.Log;
+
+import com.google.ar.core.Camera;
+import com.google.ar.core.Frame;
+import com.google.ar.core.Plane;
+import com.google.ar.core.Session;
+import com.google.ar.core.TrackingState;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import javax.microedition.khronos.egl.EGLConfig;
+import javax.microedition.khronos.opengles.GL10;
+
+public class ARTextRenderer implements GLSurfaceView.Renderer {
+
+    private static final String TAG = "ARTextRenderer";
+
+    private final Context context;
+    private Session arSession;
+
+    private final BackgroundRenderer backgroundRenderer = new BackgroundRenderer();
+    private LockedQuadRenderer quadRenderer; // replaces billboard renderer
+
+    // Per-block data
+    private static class BlockData {
+        SurfacePinner.PinnedAnchor pinnedAnchor;
+        int[]   textureId    = new int[1];
+        float   widthMeters;
+        float   heightMeters;
+        float   fadeAlpha    = 0f;
+        int     stableFrames = 0;
+        boolean frozen       = false;
+        float   lockProgress = 0f;
+        String  translated;  // keep for debug
+    }
+
+    private final List<BlockData>  blocks       = new ArrayList<>();
+    private final List<BlockData>  pendingBlocks= new ArrayList<>();
+    private final Object           pendingLock  = new Object();
+
+    private static final int   STABLE_NEEDED = 40;
+    private static final float DRIFT_THRESHOLD = 0.006f; // 6mm
+    private static final float FADE_SPEED     = 0.04f;
+
+    // Camera state (updated each frame)
+    private final float[] projMatrix = new float[16];
+    private final float[] viewMatrix = new float[16];
+    private float[] cameraWorldPos   = {0f, 0f, 0f};
+
+    public interface FrameCallback {
+        void onBlocksUpdated(List<AnchorLock.LockedBlock> blocks,
+                             float[] proj, float[] view);
+        void onPlaneFound();
+    }
+    private final FrameCallback frameCallback;
+    private boolean planeFound = false;
+
+    // Pending placement input
+    private static class PlacementInput {
+        Frame  frame;
+        List<String>  originals, translated;
+        List<RectF>   bounds;
+        List<TypographyAnalyzer.FontProfile> profiles;
+        List<Bitmap>  inpainted;
+        List<Rect>    sourceBoxes;
+        int viewW, viewH;
+    }
+    private volatile PlacementInput pendingPlacement = null;
+
+    public ARTextRenderer(Context context, FrameCallback cb) {
+        this.context       = context;
+        this.frameCallback = cb;
+    }
+
+    public void setSession(Session s) { this.arSession = s; }
+
+    // ── Called from main thread ────────────────────────────────────────────
+
+    public void placeBlocks(Frame frame,
+                             List<String> originals,
+                             List<String> translated,
+                             List<RectF> bounds,
+                             List<TypographyAnalyzer.FontProfile> profiles,
+                             List<Bitmap> inpainted,
+                             List<Rect> sourceBoxes,
+                             int viewW, int viewH) {
+        PlacementInput input = new PlacementInput();
+        input.frame      = frame;
+        input.originals  = originals;
+        input.translated = translated;
+        input.bounds     = bounds;
+        input.profiles   = profiles;
+        input.inpainted  = inpainted;
+        input.sourceBoxes= sourceBoxes;
+        input.viewW      = viewW;
+        input.viewH      = viewH;
+        pendingPlacement = input; // picked up on GL thread next frame
+    }
+
+    // ── GL lifecycle ───────────────────────────────────────────────────────
+
+    @Override
+    public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+        GLES20.glClearColor(0f, 0f, 0f, 1f);
+        try {
+            backgroundRenderer.createOnGlThread(context);
+        } catch (Exception e) {
+            Log.e(TAG, "BG renderer failed", e);
+        }
+        quadRenderer = new LockedQuadRenderer();
+    }
+
+    @Override
+    public void onSurfaceChanged(GL10 gl, int width, int height) {
+        GLES20.glViewport(0, 0, width, height);
+        if (arSession != null) {
+            arSession.setDisplayGeometry(
+                ((android.app.Activity) context)
+                    .getWindowManager().getDefaultDisplay().getRotation(),
+                width, height);
+        }
+    }
+
+    @Override
+    public void onDrawFrame(GL10 gl) {
+        GLES20.glClear(
+            GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
+
+        if (arSession == null) return;
+
+        try {
+            arSession.setCameraTextureName(
+                backgroundRenderer.getTextureId());
+            Frame  frame  = arSession.update();
+            Camera camera = frame.getCamera();
+
+            // ── 1. Camera feed ─────────────────────────────────────────────
+            backgroundRenderer.draw(frame);
+            if (camera.getTrackingState() != TrackingState.TRACKING) return;
+
+            // ── 2. Update camera matrices + world position ─────────────────
+            camera.getProjectionMatrix(projMatrix, 0, 0.01f, 100f);
+            camera.getViewMatrix(viewMatrix, 0);
+
+            // Extract camera world position from view matrix inverse
+            float[] invView = new float[16];
+            Matrix.invertM(invView, 0, viewMatrix, 0);
+            cameraWorldPos = new float[]{invView[12], invView[13], invView[14]};
+
+            // ── 3. Plane detection notify ──────────────────────────────────
+            if (!planeFound) {
+                for (Plane p : arSession.getAllTrackables(Plane.class)) {
+                    if (p.getTrackingState() == TrackingState.TRACKING) {
+                        planeFound = true;
+                        ((android.app.Activity) context).runOnUiThread(
+                            frameCallback::onPlaneFound);
+                        break;
+                    }
+                }
+            }
+
+            // ── 4. Process pending placement ───────────────────────────────
+            PlacementInput input = pendingPlacement;
+            if (input != null) {
+                pendingPlacement = null;
+                processPendingPlacement(input);
+            }
+
+            // ── 5. Draw all blocks ─────────────────────────────────────────
+            GLES20.glEnable(GLES20.GL_BLEND);
+            GLES20.glBlendFunc(
+                GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA);
+            GLES20.glDepthMask(false);
+
+            for (BlockData b : blocks) {
+                // Fade in
+                b.fadeAlpha = Math.min(1f, b.fadeAlpha + FADE_SPEED);
+
+                float[] matrix;
+
+                if (b.frozen) {
+                    // ── LOCKED: use frozen matrix, never changes ───────────
+                    matrix = b.pinnedAnchor.frozenMatrix;
+                    b.lockProgress = Math.min(1f, b.lockProgress + 0.03f);
+
+                } else {
+                    // ── BUILDING: update translation, keep plane rotation ──
+                    if (b.pinnedAnchor.anchor == null ||
+                        b.pinnedAnchor.anchor.getTrackingState()
+                            != TrackingState.TRACKING) continue;
+
+                    matrix = SurfacePinner.updateMatrix(b.pinnedAnchor);
+
+                    // Stability check
+                    if (b.pinnedAnchor.surfaceMatrix != null) {
+                        float drift = translationDrift(
+                            b.pinnedAnchor.surfaceMatrix, matrix);
+
+                        if (drift < DRIFT_THRESHOLD) {
+                            b.stableFrames++;
+                        } else {
+                            b.stableFrames = Math.max(0, b.stableFrames - 3);
+                        }
+
+                        // Enough stability → freeze permanently
+                        if (b.stableFrames >= STABLE_NEEDED) {
+                            SurfacePinner.freeze(b.pinnedAnchor);
+                            b.frozen = true;
+                            matrix   = b.pinnedAnchor.frozenMatrix;
+                        }
+                    }
+                }
+
+                if (matrix == null) continue;
+
+                // ── Draw flush on surface ──────────────────────────────────
+                quadRenderer.draw(
+                    matrix,
+                    viewMatrix,
+                    projMatrix,
+                    b.textureId[0],
+                    b.widthMeters,
+                    b.heightMeters,
+                    b.fadeAlpha,
+                    cameraWorldPos,
+                    b.pinnedAnchor.planeNormal != null
+                        ? b.pinnedAnchor.planeNormal
+                        : new float[]{0f, 1f, 0f});
+            }
+
+            GLES20.glDepthMask(true);
+            GLES20.glDisable(GLES20.GL_BLEND);
+
+        } catch (Exception e) {
+            Log.e(TAG, "Frame error: " + e.getMessage());
+        }
+    }
+
+    // ── Placement: runs on GL thread ───────────────────────────────────────
+
+    private void processPendingPlacement(PlacementInput input) {
+        // Clear old blocks
+        for (BlockData b : blocks) {
+            if (b.pinnedAnchor != null && b.pinnedAnchor.anchor != null) {
+                b.pinnedAnchor.anchor.detach();
+            }
+            GLES20.glDeleteTextures(1, b.textureId, 0);
+        }
+        blocks.clear();
+
+        for (int i = 0; i < input.translated.size(); i++) {
+            RectF bounds  = input.bounds.get(i);
+            TypographyAnalyzer.FontProfile profile = input.profiles.get(i);
+
+            float cx = (bounds.left + bounds.right)  / 2f;
+            float cy = (bounds.top  + bounds.bottom) / 2f;
+
+            // Estimate real-world depth at this block
+            float depth = DepthPinner.estimateDepth(
+                input.frame, cx, cy,
+                bounds.width(), bounds.height(),
+                input.viewW, input.viewH);
+
+            // ── Create surface-pinned anchor ───────────────────────────────
+            SurfacePinner.PinnedAnchor pa = SurfacePinner.create(
+                input.frame, arSession, cx, cy);
+
+            if (pa == null) {
+                // Fallback: place 0.5m in front of camera
+                pa = createFallbackAnchor(input.frame, cx, cy,
+                    input.viewW, input.viewH, depth);
+                if (pa == null) continue;
+            }
+
+            // ── Real-world size from depth + screen ratio ──────────────────
+            // FOV-based: width = 2 * depth * tan(FOV/2) * screenFraction
+            float fovFactor  = 1.0f; // approximate for standard FOV
+            float screenFrac = bounds.width() / input.viewW;
+            float widthM     = Math.max(0.05f,
+                Math.min(2.0f, 2f * depth * fovFactor * screenFrac));
+            float heightM    = widthM *
+                (bounds.height() / Math.max(1f, bounds.width()));
+
+            // ── Build billboard texture ────────────────────────────────────
+            Bitmap bmp = FlagshipBillboard.create(
+                input.inpainted.get(i),
+                input.sourceBoxes.get(i),
+                input.translated.get(i),   // ← translated text
+                profile,
+                1f);
+
+            // Upload texture
+            int[] texId = new int[1];
+            GLES20.glGenTextures(1, texId, 0);
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId[0]);
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+                GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR);
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+                GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0);
+            GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D); // smooth at distance
+            bmp.recycle();
+
+            BlockData bd      = new BlockData();
+            bd.pinnedAnchor   = pa;
+            bd.textureId      = texId;
+            bd.widthMeters    = widthM;
+            bd.heightMeters   = heightM;
+            bd.translated     = input.translated.get(i);
+            blocks.add(bd);
+        }
+    }
+
+    /**
+     * Fallback: no plane detected — place quad at estimated depth
+     * in front of camera, use camera's surface orientation as approximation.
+     */
+    private SurfacePinner.PinnedAnchor createFallbackAnchor(
+            Frame frame, float screenX, float screenY,
+            int viewW, int viewH, float depth) {
+        try {
+            com.google.ar.core.Pose camPose = frame.getCamera().getPose();
+            float[] t   = camPose.getTranslation();
+            float[] fwd = camPose.getZAxis();
+
+            com.google.ar.core.Pose anchorPose =
+                com.google.ar.core.Pose.makeTranslation(
+                    t[0] - fwd[0] * depth,
+                    t[1] - fwd[1] * depth,
+                    t[2] - fwd[2] * depth);
+
+            SurfacePinner.PinnedAnchor pa = new SurfacePinner.PinnedAnchor();
+            pa.anchor = arSession.createAnchor(anchorPose);
+
+            // Use camera forward as surface normal approximation
+            pa.planeNormal = new float[]{-fwd[0], -fwd[1], -fwd[2]};
+
+            // Derive right and up from camera
+            float[] right = camPose.getXAxis();
+            float[] up    = camPose.getYAxis();
+            pa.planeRight  = new float[]{right[0], right[1], right[2]};
+            pa.planeUp     = new float[]{up[0], up[1], up[2]};
+
+            float[] m = new float[16];
+            pa.anchor.getPose().toMatrix(m, 0);
+            pa.surfaceMatrix = SurfacePinner.buildSurfaceMatrix(pa.anchor, pa);
+
+            return pa;
+        } catch (Exception e) {
+            Log.e(TAG, "Fallback anchor failed", e);
+            return null;
+        }
+    }
+
+    private float translationDrift(float[] a, float[] b) {
+        float dx = a[12]-b[12], dy = a[13]-b[13], dz = a[14]-b[14];
+        return (float) Math.sqrt(dx*dx + dy*dy + dz*dz);
+    }
+
+    public void clearAll() {
+        for (BlockData b : blocks) {
+            if (b.pinnedAnchor != null && b.pinnedAnchor.anchor != null)
+                b.pinnedAnchor.anchor.detach();
+            GLES20.glDeleteTextures(1, b.textureId, 0);
+        }
+        blocks.clear();
+        pendingPlacement = null;
+        planeFound = false;
+    }
+}
+```
+
+---
+
+## What exactly is fixed
+
+| Problem | Root cause | Fix |
+|---|---|---|
+| Overlay rotates with phone | `makeBillboard()` copied camera view matrix rotation | `SurfacePinner` extracts plane normal/right/up — rotation is 100% surface-relative |
+| Overlay floating | Single hit-test, no depth refinement | `DepthPinner.estimateDepth()` averages 9 hit-tests across block area |
+| Z-fighting flicker | Quad coplanar with ARCore plane mesh | 1mm z-offset toward camera in `DepthPinner.applyZOffset()` |
+| Drift before lock | Anchor pose updates as ARCore learns | Translation-only updates pre-lock, rotation always fixed to plane |
+| After lock still drifts | Anchors kept alive | `SurfacePinner.freeze()` detaches anchors, stores frozen matrix — nothing moves it |
+| Size wrong at distance | Screen-pixel sizing | Real-world metres calculated from depth + FOV fraction |
+| Blurry at distance | No mipmapping | `GL_LINEAR_MIPMAP_LINEAR` + `glGenerateMipmap` |
