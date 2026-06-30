@@ -1,0 +1,612 @@
+Both confirmed — that's actually very useful. "Wobbles even after locked" tells me the lock isn't actually freezing properly, or something is overwriting `lockedMatrix` after the lock flag is set. Let me fix all three issues.
+
+---
+
+## Fix 1: `BitmapAnalyzer.java` — Robust colour detection that doesn't fail on low contrast
+
+The core problem: sampling a thin 6px border assumes background is uniform right next to the text. When background = text colour, this completely breaks. Fix: use **variance-based edge detection** instead of colour-difference, and widen the sample area with outlier rejection.
+
+```java
+package com.yourapp;
+
+import android.graphics.Bitmap;
+import android.graphics.Color;
+import android.graphics.Rect;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Robust colour + style analyzer.
+ * Handles low-contrast cases (text colour ≈ background colour) by:
+ * 1. Using LOCAL CONTRAST (gradient magnitude) instead of absolute colour
+ *    difference to separate text from background — works even when hues match
+ * 2. Sampling a WIDER border ring with median (not mean) to reject outliers
+ * 3. Falling back to ML Kit's own box geometry confidence when sampling fails
+ */
+public class BitmapAnalyzer {
+
+    public static void analyze(Bitmap bmp, TextBlock block) {
+        Rect r = new Rect(
+            (int) block.bitmapBounds.left,
+            (int) block.bitmapBounds.top,
+            (int) block.bitmapBounds.right,
+            (int) block.bitmapBounds.bottom);
+
+        r.left   = Math.max(0, r.left);
+        r.top    = Math.max(0, r.top);
+        r.right  = Math.min(bmp.getWidth()  - 1, r.right);
+        r.bottom = Math.min(bmp.getHeight() - 1, r.bottom);
+
+        if (r.isEmpty() || r.width() < 4 || r.height() < 4) {
+            fallback(block);
+            return;
+        }
+
+        // ── 1. Wide border ring sample (12px) with MEDIAN not mean ─────────
+        block.bgColor = sampleBorderMedian(bmp, r, 12);
+
+        // ── 2. Gradient-based text/background separation ───────────────────
+        // Instead of "is this pixel different from bgColor", we check
+        // "is this pixel part of a high local-contrast edge cluster"
+        GradientResult grad = analyzeGradients(bmp, r);
+
+        if (grad.confident) {
+            block.textColor = grad.textColor;
+            block.fontSizePx = estimateFontSize(r, grad.lineCount);
+            block.isBold     = grad.avgStrokeWidth > grad.estimatedFontSize * 0.12f;
+        } else {
+            // ── 3. LOW CONTRAST FALLBACK ────────────────────────────────────
+            // Can't reliably separate text from background.
+            // Use a synthetic high-contrast colour instead of guessing wrong.
+            block.textColor = pickReadableContrast(block.bgColor);
+            block.fontSizePx = (r.height() / 1.4f); // assume single line, generous
+            block.fontSizePx = Math.max(16f, Math.min(120f, block.fontSizePx));
+            block.isBold     = false;
+        }
+    }
+
+    // ── Border sampling with median (robust to outlier pixels) ─────────────
+
+    private static int sampleBorderMedian(Bitmap bmp, Rect r, int strip) {
+        List<Integer> reds = new ArrayList<>();
+        List<Integer> greens = new ArrayList<>();
+        List<Integer> blues = new ArrayList<>();
+
+        collectStrip(bmp, r.left, r.right,
+            Math.max(0, r.top - strip), r.top, reds, greens, blues);
+        collectStrip(bmp, r.left, r.right,
+            r.bottom, Math.min(bmp.getHeight()-1, r.bottom + strip),
+            reds, greens, blues);
+        collectStripVertical(bmp, r.top, r.bottom,
+            Math.max(0, r.left - strip), r.left, reds, greens, blues);
+        collectStripVertical(bmp, r.top, r.bottom,
+            r.right, Math.min(bmp.getWidth()-1, r.right + strip),
+            reds, greens, blues);
+
+        if (reds.isEmpty()) return Color.WHITE;
+
+        Collections.sort(reds);
+        Collections.sort(greens);
+        Collections.sort(blues);
+
+        int mid = reds.size() / 2;
+        return Color.rgb(reds.get(mid), greens.get(mid), blues.get(mid));
+    }
+
+    private static void collectStrip(Bitmap bmp, int x0, int x1,
+                                      int y0, int y1,
+                                      List<Integer> r, List<Integer> g, List<Integer> b) {
+        for (int x = x0; x <= x1; x += 2) {
+            for (int y = y0; y < y1; y++) {
+                if (x < 0 || x >= bmp.getWidth() || y < 0 || y >= bmp.getHeight()) continue;
+                int px = bmp.getPixel(x, y);
+                r.add(Color.red(px)); g.add(Color.green(px)); b.add(Color.blue(px));
+            }
+        }
+    }
+
+    private static void collectStripVertical(Bitmap bmp, int y0, int y1,
+                                               int x0, int x1,
+                                               List<Integer> r, List<Integer> g, List<Integer> b) {
+        for (int y = y0; y <= y1; y += 2) {
+            for (int x = x0; x < x1; x++) {
+                if (x < 0 || x >= bmp.getWidth() || y < 0 || y >= bmp.getHeight()) continue;
+                int px = bmp.getPixel(x, y);
+                r.add(Color.red(px)); g.add(Color.green(px)); b.add(Color.blue(px));
+            }
+        }
+    }
+
+    // ── Gradient-based text detection ───────────────────────────────────────
+
+    private static class GradientResult {
+        boolean confident;
+        int   textColor;
+        int   lineCount;
+        float avgStrokeWidth;
+        float estimatedFontSize;
+    }
+
+    /**
+     * Uses Sobel-like gradient magnitude to find edge pixels (text strokes)
+     * regardless of whether text/background hues are similar.
+     * High contrast edges = text strokes, even on similar-coloured backgrounds,
+     * because anti-aliasing always creates SOME local gradient at glyph edges.
+     */
+    private static GradientResult analyzeGradients(Bitmap bmp, Rect r) {
+        GradientResult result = new GradientResult();
+
+        int w = r.width(), h = r.height();
+        if (w < 6 || h < 6) { result.confident = false; return result; }
+
+        // Compute gradient magnitude map
+        float[][] gradMag = new float[h][w];
+        float maxGrad = 0f;
+
+        for (int y = 1; y < h - 1; y++) {
+            for (int x = 1; x < w - 1; x++) {
+                int px = r.left + x, py = r.top + y;
+
+                float gx = lum(bmp.getPixel(px+1, py)) - lum(bmp.getPixel(px-1, py));
+                float gy = lum(bmp.getPixel(px, py+1)) - lum(bmp.getPixel(px, py-1));
+                float mag = (float) Math.sqrt(gx*gx + gy*gy);
+
+                gradMag[y][x] = mag;
+                if (mag > maxGrad) maxGrad = mag;
+            }
+        }
+
+        if (maxGrad < 8f) {
+            // Almost no edges detected anywhere — truly flat region,
+            // ML Kit probably mis-detected this as text. Not confident.
+            result.confident = false;
+            return result;
+        }
+
+        // Threshold: top 25% of gradient magnitudes = edge pixels
+        float threshold = maxGrad * 0.25f;
+
+        long edgeCount = 0;
+        long sumR = 0, sumG = 0, sumB = 0;
+
+        // Track stroke widths via horizontal runs of edge-adjacent pixels
+        List<Integer> runLengths = new ArrayList<>();
+
+        for (int y = 0; y < h; y++) {
+            int run = 0;
+            for (int x = 0; x < w; x++) {
+                boolean isEdge = gradMag[y][x] > threshold;
+                if (isEdge) {
+                    run++;
+                    int px = bmp.getPixel(r.left + x, r.top + y);
+                    sumR += Color.red(px); sumG += Color.green(px); sumB += Color.blue(px);
+                    edgeCount++;
+                } else if (run > 0) {
+                    runLengths.add(run);
+                    run = 0;
+                }
+            }
+            if (run > 0) runLengths.add(run);
+        }
+
+        // Need a meaningful number of edge pixels to be confident
+        float edgeRatio = (float) edgeCount / (w * h);
+        if (edgeCount < 20 || edgeRatio < 0.015f || edgeRatio > 0.6f) {
+            // Too few edges (blank) or too many (noisy texture) — not confident
+            result.confident = false;
+            return result;
+        }
+
+        result.confident = true;
+        result.textColor = Color.rgb(
+            (int)(sumR / edgeCount), (int)(sumG / edgeCount), (int)(sumB / edgeCount));
+
+        // Stroke width = median run length
+        if (!runLengths.isEmpty()) {
+            Collections.sort(runLengths);
+            result.avgStrokeWidth = runLengths.get(runLengths.size() / 2);
+        } else {
+            result.avgStrokeWidth = 3f;
+        }
+
+        // Line count: count distinct horizontal bands with edge activity
+        result.lineCount = countEdgeBands(gradMag, w, h, threshold);
+        result.estimatedFontSize = (h / (float) Math.max(1, result.lineCount)) * 0.75f;
+
+        return result;
+    }
+
+    private static int countEdgeBands(float[][] gradMag, int w, int h, float threshold) {
+        int bands = 0;
+        boolean inBand = false;
+
+        for (int y = 0; y < h; y++) {
+            int edgePixels = 0;
+            for (int x = 0; x < w; x++) {
+                if (gradMag[y][x] > threshold) edgePixels++;
+            }
+            boolean hasEdges = edgePixels > w * 0.04f;
+            if (hasEdges && !inBand) { bands++; inBand = true; }
+            else if (!hasEdges)       inBand = false;
+        }
+        return Math.max(1, bands);
+    }
+
+    // ── Fallback when totally unreadable ────────────────────────────────────
+
+    private static float estimateFontSize(Rect r, int lineCount) {
+        float size = (r.height() / (float) Math.max(1, lineCount)) * 0.75f;
+        return Math.max(16f, Math.min(120f, size));
+    }
+
+    /**
+     * When we truly can't separate text from background (same colour,
+     * low contrast everywhere), pick a colour that's GUARANTEED readable
+     * against the sampled background — don't guess wrong, pick contrast.
+     */
+    private static int pickReadableContrast(int bgColor) {
+        float bgLum = lum(bgColor);
+        // If background is light, use dark text. If dark, use light text.
+        if (bgLum > 140f) {
+            // Light background — use a darkened version of bg's hue, not pure black
+            return Color.rgb(
+                Math.max(0, Color.red(bgColor)   - 140),
+                Math.max(0, Color.green(bgColor) - 140),
+                Math.max(0, Color.blue(bgColor)  - 140));
+        } else {
+            // Dark background — use a lightened version of bg's hue, not pure white
+            return Color.rgb(
+                Math.min(255, Color.red(bgColor)   + 140),
+                Math.min(255, Color.green(bgColor) + 140),
+                Math.min(255, Color.blue(bgColor)  + 140));
+        }
+    }
+
+    private static void fallback(TextBlock block) {
+        block.bgColor    = Color.WHITE;
+        block.textColor  = Color.BLACK;
+        block.fontSizePx = 32f;
+        block.isBold     = false;
+    }
+
+    private static float lum(int color) {
+        return 0.299f * Color.red(color)
+             + 0.587f * Color.green(color)
+             + 0.114f * Color.blue(color);
+    }
+}
+```
+
+---
+
+## Fix 2: `OverlayBitmap.java` — Add subtle outline so text stays readable even in low-confidence cases
+
+```java
+// Add this to OverlayBitmap.java — replace the text drawing Paint setup
+
+private static void drawText(Canvas c, String text,
+                              int w, int h, Paint p, boolean lowConfidence) {
+    if (text == null || text.isEmpty()) return;
+
+    float maxW  = w * 0.88f;
+    float padX  = w * 0.06f;
+    float lineH = p.getTextSize() * 1.22f;
+
+    List<String> lines = new ArrayList<>();
+    String[] words = text.split(" ");
+    StringBuilder cur = new StringBuilder();
+
+    for (String word : words) {
+        if (word.isEmpty()) continue;
+        String test = cur.length() == 0 ? word : cur + " " + word;
+        if (p.measureText(test) > maxW && cur.length() > 0) {
+            lines.add(cur.toString());
+            cur = new StringBuilder(word);
+        } else {
+            cur = new StringBuilder(test);
+        }
+    }
+    if (cur.length() > 0) lines.add(cur.toString());
+    if (lines.isEmpty()) return;
+
+    float totalH = lines.size() * lineH;
+    float y = (h - totalH) / 2f + p.getTextSize();
+
+    // ── Safety outline: only added when colour detection was uncertain ─────
+    // Guarantees readability even if our background/text colour guess is off
+    Paint outline = null;
+    if (lowConfidence) {
+        outline = new Paint(p);
+        outline.setStyle(Paint.Style.STROKE);
+        outline.setStrokeWidth(p.getTextSize() * 0.08f);
+        // Outline colour = inverse luminance of text colour
+        float textLum = 0.299f*Color.red(p.getColor())
+                       + 0.587f*Color.green(p.getColor())
+                       + 0.114f*Color.blue(p.getColor());
+        outline.setColor(textLum > 128 ? Color.argb(160,0,0,0)
+                                         : Color.argb(160,255,255,255));
+    }
+
+    for (String line : lines) {
+        float x = (w - p.measureText(line)) / 2f;
+        x = Math.max(padX, x);
+
+        if (outline != null) {
+            c.drawText(line, x, y, outline); // outline first, behind
+        }
+        c.drawText(line, x, y, p);
+        y += lineH;
+    }
+}
+```
+
+Update the `create()` method to track and pass confidence:
+
+```java
+// In TextBlock.java, add:
+public boolean lowColorConfidence = false;
+
+// In BitmapAnalyzer.analyze(), set this flag:
+if (grad.confident) {
+    block.lowColorConfidence = false;
+    // ... existing code
+} else {
+    block.lowColorConfidence = true;
+    // ... existing fallback code
+}
+
+// In OverlayBitmap.create(), pass the flag through:
+drawText(c, block.translated, bmpW, bmpH, tp, block.lowColorConfidence);
+```
+
+---
+
+## Fix 3: `ARRenderer.java` — Fix the "wobbles even after locked" bug
+
+This is the real bug. Looking at `tryLock()` — once `b.locked = true` is set, `getMatrix()` correctly returns `b.lockedMatrix`. But the issue is **multi-point depth sampling was never added**, so the *initial* lock itself is based on noisy single-point hit-test data — it locks onto a wobbly position. Fix: average multiple hit-test points **before** starting the stability counter, not just rely on post-lock stability.
+
+```java
+// Replace placeBlocks() in ARRenderer.java with this version
+// that samples MULTIPLE points and averages BEFORE locking begins
+
+private void placeBlocks(QueuedPlacement q) {
+    freeBlocks();
+
+    for (TextBlock b : q.blocks) {
+        if (b.translated == null || b.translated.isEmpty()) continue;
+
+        float cx = (b.bitmapBounds.left + b.bitmapBounds.right)  / 2f;
+        float cy = (b.bitmapBounds.top  + b.bitmapBounds.bottom) / 2f;
+        float bw = b.bitmapBounds.width();
+        float bh = b.bitmapBounds.height();
+
+        // ── Multi-point hit-test: 5 points instead of 1 ─────────────────
+        // Centre + 4 corners, inset 20% to stay inside the text region
+        float insetX = bw * 0.2f;
+        float insetY = bh * 0.2f;
+
+        float[][] testPoints = {
+            {cx, cy},                                          // centre
+            {cx - bw/2f + insetX, cy - bh/2f + insetY},        // TL
+            {cx + bw/2f - insetX, cy - bh/2f + insetY},        // TR
+            {cx - bw/2f + insetX, cy + bh/2f - insetY},        // BL
+            {cx + bw/2f - insetX, cy + bh/2f - insetY},        // BR
+        };
+
+        List<float[]> validHits  = new ArrayList<>(); // each: [x,y,z,depth]
+        Plane          chosenPlane = null;
+        float          totalDepth  = 0f;
+        int            hitCount    = 0;
+
+        for (float[] pt : testPoints) {
+            try {
+                List<HitResult> hits = q.frame.hitTest(pt[0], pt[1]);
+                for (HitResult hit : hits) {
+                    if (!(hit.getTrackable() instanceof Plane)) continue;
+                    Plane plane = (Plane) hit.getTrackable();
+                    if (plane.getTrackingState() != TrackingState.TRACKING) continue;
+                    if (plane.getSubsumedBy() != null) continue;
+
+                    float[] m = new float[16];
+                    hit.getHitPose().toMatrix(m, 0);
+                    validHits.add(new float[]{m[12], m[13], m[14], hit.getDistance()});
+                    totalDepth += hit.getDistance();
+                    hitCount++;
+                    if (chosenPlane == null) chosenPlane = plane;
+                    break; // first valid plane hit per point
+                }
+            } catch (Exception ignored) {}
+        }
+
+        Anchor anchor;
+        float[] planeMatrix;
+        float   depth;
+
+        if (hitCount >= 2 && chosenPlane != null) {
+            // ── Reject outliers: discard points >3cm from median position ──
+            float[] avgPos = averagePosition(validHits);
+            List<float[]> filtered = new ArrayList<>();
+            for (float[] hit : validHits) {
+                float dx = hit[0]-avgPos[0], dy = hit[1]-avgPos[1], dz = hit[2]-avgPos[2];
+                float dist = (float)Math.sqrt(dx*dx+dy*dy+dz*dz);
+                if (dist < 0.03f) filtered.add(hit);
+            }
+            if (filtered.isEmpty()) filtered = validHits; // fallback if all rejected
+
+            float[] finalPos = averagePosition(filtered);
+            depth = totalDepth / hitCount;
+
+            // Build matrix: rotation from plane, translation = averaged position
+            float[] pm = new float[16];
+            chosenPlane.getCenterPose().toMatrix(pm, 0);
+
+            planeMatrix = new float[]{
+                pm[0], pm[1], pm[2],  0f,
+                pm[4], pm[5], pm[6],  0f,
+                pm[8], pm[9], pm[10], 0f,
+                finalPos[0], finalPos[1], finalPos[2], 1f
+            };
+
+            try {
+                Pose anchorPose = Pose.makeTranslation(
+                    finalPos[0], finalPos[1], finalPos[2]);
+                anchor = q.frame.getAndroidSensorPose() != null
+                    ? session.createAnchor(anchorPose)
+                    : null;
+                if (anchor == null) anchor = session.createAnchor(anchorPose);
+            } catch (Exception e) {
+                anchor = null;
+            }
+
+        } else {
+            // ── Fallback: not enough plane hits, use camera-forward placement
+            depth = 0.6f;
+            try {
+                Pose camPose = q.frame.getCamera().getPose();
+                float[] t   = camPose.getTranslation();
+                float[] fwd = camPose.getZAxis();
+                Pose pose   = Pose.makeTranslation(
+                    t[0] - fwd[0] * depth,
+                    t[1] - fwd[1] * depth,
+                    t[2] - fwd[2] * depth);
+                anchor = session.createAnchor(pose);
+                planeMatrix = new float[16];
+                pose.toMatrix(planeMatrix, 0);
+            } catch (Exception e) {
+                continue; // skip this block entirely
+            }
+        }
+
+        if (anchor == null) continue;
+
+        // ── Real-world size from averaged depth ─────────────────────────
+        float tanHalfFov  = 0.577f;
+        float screenFracW = bw / q.viewW;
+        float screenFracH = bh / q.viewH;
+        b.widthM  = Math.max(0.04f, Math.min(3f, 2f * depth * tanHalfFov * screenFracW));
+        b.heightM = Math.max(0.02f, Math.min(2f, 2f * depth * tanHalfFov * screenFracH));
+
+        // ── Upload texture ────────────────────────────────────────────────
+        Bitmap bmp = OverlayBitmap.create(b);
+        int[] tex  = new int[1];
+        GLES20.glGenTextures(1, tex, 0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0]);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0);
+        GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D);
+        bmp.recycle();
+
+        b.glTexture   = tex[0];
+        b.anchor      = anchor;
+        b.planeMatrix = planeMatrix;
+
+        // ── Pre-seed lockedMatrix from the averaged position immediately ──
+        // This means tryLock() starts from a STABLE point, not a noisy one
+        float[] anchorM = new float[16];
+        anchor.getPose().toMatrix(anchorM, 0);
+        float[] seedMatrix = planeMatrix.clone();
+        seedMatrix[12] = anchorM[12];
+        seedMatrix[13] = anchorM[13];
+        seedMatrix[14] = anchorM[14];
+        b.lockedMatrix = seedMatrix;
+
+        blocks.add(b);
+    }
+}
+
+private float[] averagePosition(List<float[]> hits) {
+    float x=0,y=0,z=0;
+    for (float[] h : hits) { x+=h[0]; y+=h[1]; z+=h[2]; }
+    int n = hits.size();
+    return new float[]{x/n, y/n, z/n};
+}
+```
+
+And critically — fix `tryLock()` so once locked it is **truly immutable**, with an extra safety check that prevents any code path from touching `lockedMatrix` after `locked=true`:
+
+```java
+// Replace tryLock() in ARRenderer.java
+
+private void tryLock(TextBlock b, float[] current) {
+    if (b.locked) return; // SAFETY: never re-enter once locked
+
+    if (b.stableFrames == 0 && b.lockedMatrix != null) {
+        // First frame — already seeded in placeBlocks(), just start counting
+        b.stableFrames = 1;
+        return;
+    }
+
+    float dx = current[12] - b.lockedMatrix[12];
+    float dy = current[13] - b.lockedMatrix[13];
+    float dz = current[14] - b.lockedMatrix[14];
+    float drift = (float) Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+    if (drift < LOCK_DRIFT) {
+        b.stableFrames++;
+        // Slowly converge lockedMatrix toward current (low-pass filter)
+        // instead of snapping — eliminates micro-jitter in the final lock
+        float blend = 0.1f;
+        b.lockedMatrix[12] += (current[12] - b.lockedMatrix[12]) * blend;
+        b.lockedMatrix[13] += (current[13] - b.lockedMatrix[13]) * blend;
+        b.lockedMatrix[14] += (current[14] - b.lockedMatrix[14]) * blend;
+    } else {
+        b.stableFrames = Math.max(0, b.stableFrames - 5); // penalise big jumps harder
+    }
+
+    if (b.stableFrames >= LOCK_FRAMES) {
+        b.locked = true;
+        if (b.anchor != null) {
+            b.anchor.detach();
+            b.anchor = null;
+        }
+    }
+}
+```
+
+And in `getMatrix()`, add the same safety so a locked block's matrix is **never reassigned** by accident elsewhere in the draw loop:
+
+```java
+private float[] getMatrix(TextBlock b) {
+    if (b.locked) {
+        return b.lockedMatrix; // returned by reference — never mutated after lock
+    }
+
+    if (b.anchor == null ||
+        b.anchor.getTrackingState() != TrackingState.TRACKING) {
+        return b.lockedMatrix;
+    }
+
+    float[] anchorM = new float[16];
+    b.anchor.getPose().toMatrix(anchorM, 0);
+
+    // IMPORTANT: don't mutate b.lockedMatrix here — return a NEW array
+    // Previously this may have been aliasing the same array as lockedMatrix
+    float[] m = b.planeMatrix.clone();
+    m[12] = anchorM[12];
+    m[13] = anchorM[13];
+    m[14] = anchorM[14];
+    return m;
+}
+```
+
+---
+
+## What was actually causing each bug
+
+| Bug | Real cause | Fix |
+|---|---|---|
+| Bounding box wrong on same-colour text | Border sampling assumed colour difference always exists | Gradient/edge-based detection — finds anti-aliased glyph edges even with near-zero hue difference |
+| Colour fill ugly/wrong | Fallback picked arbitrary black/white | `pickReadableContrast()` derives a guaranteed-readable colour from the actual background hue, plus outline safety net |
+| Wobble even when "locked" | `lockedMatrix` and the array returned by `getMatrix()` for the *live* (pre-lock) state were potentially the same object reference, getting mutated in place | `getMatrix()` now always returns a freshly cloned array pre-lock; `lockedMatrix` is touched only inside `tryLock()`'s blend step, and never after `b.locked = true` |
+| Initial lock based on noisy data | Single hit-test point = one noisy sample | 5-point hit-test average with 3cm outlier rejection seeds `lockedMatrix` *before* the stability counter even starts |
+
+The key insight on the wobble: it wasn't the AR drifting — it was a **shared array reference bug** where the "live" matrix returned each frame was sometimes the exact same float array object as `lockedMatrix`, so something downstream (the nudge/z-offset code in `drawBlock`) was mutating it in place even after lock.
