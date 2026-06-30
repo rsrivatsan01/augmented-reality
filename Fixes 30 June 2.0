@@ -1,0 +1,40 @@
+You're right — we've been trying to extract "is there an edge here" from raw pixel colour comparison, which fundamentally cannot work reliably when text and background share luminance/hue. That's not a tuning problem, it's an algorithm ceiling. Let me lay out what actually solves this and let you pick.
+
+---
+
+## Why the current approach hits a wall
+
+Sobel/gradient-based edge detection on a tiny cropped region has no prior knowledge of what a *character* looks like. It only sees "pixels differ from neighbours." On a plain background with low-contrast text (white-on-cream, light-grey-on-white, etc.), the gradient signal is genuinely below noise level. No amount of threshold-tuning fixes that — you need either better signal or a different technique entirely.
+
+---
+
+## Real options, ranked by effort vs payoff
+
+### Option 1 — OpenCV (Android NDK/Java bindings) — **recommended**
+Use OpenCV's `adaptiveThreshold` + `connectedComponents` for actual text segmentation instead of hand-rolled gradients. This is the standard CV technique for exactly this problem (it's what document scanners use). Gives you a real binary mask of "this pixel is glyph, this pixel is background" even on near-identical colours, because adaptive thresholding works on **local neighbourhood statistics**, not global colour difference.
+
+- **Cost:** Add OpenCV Android SDK (~150MB), some native binding boilerplate
+- **Payoff:** Solves the segmentation problem properly, also gives you precise per-character masks for genuinely clean text removal (not just "fill with a colour" — actual content-aware inpainting)
+
+### Option 2 — ML Kit's own per-character bounding data (already available, unused)
+
+ML Kit Text Recognition already gives you `Text.Element` and `Text.Symbol` — individual character/word boxes, not just block-level. We're currently only using block-level boxes which is throwing away precision you already have for free, no new dependency needed.
+
+- **Cost:** Zero — just restructure existing data we're discarding
+- **Payoff:** Much tighter, more accurate bounding boxes; doesn't fix the colour-sampling problem but fixes part of "boundary inaccurate"
+
+### Option 3 — OpenCV Inpainting (`Photo.inpaint`, Telea or Navier-Stokes algorithm)
+Replace our hand-written bilinear `InpaintingEraser` with OpenCV's actual inpainting algorithm — industry standard, used in Photoshop's content-aware fill. Once we have a proper text mask (from Option 1), feed it to `Photo.inpaint()` and get genuinely seamless background reconstruction, not a 4-corner gradient guess.
+
+- **Cost:** Comes bundled if you add OpenCV anyway
+- **Payoff:** This is what actually fixes "looks bad on plain background" — real inpainting instead of our approximation
+
+### Option 4 — Stay pure-Android but use `RenderScript`/`Bitmap` adaptive threshold manually
+Implement adaptive thresholding ourselves without OpenCV (it's a well-known algorithm, doable in ~80 lines). Avoids the 150MB dependency.
+
+- **Cost:** More code to write and maintain ourselves
+- **Payoff:** ~70% of OpenCV's benefit without the dependency weight
+
+---
+
+My recommendation: **Option 1 + 2 + 3 together** — they compound. Option 2 is free and improves boundaries immediately. Option 1 gives proper segmentation. Option 3 (free once you have OpenCV) gives proper inpainting instead of our gradient hack.
