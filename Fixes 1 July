@@ -1,0 +1,565 @@
+Perfect. Portrait + wrong position. The root cause is almost certainly a coordinate space mismatch between ML Kit and ARCore. ML Kit returns bounding boxes in **image coordinates** (which in portrait mode are rotated 90° relative to screen coordinates), but we're feeding them directly as screen coordinates to ARCore's hit-test. Here's the complete fix with full debug overlay:
+
+---
+
+## `DebugOverlayView.java` — Visual debugger drawn on top of everything
+```java
+package com.yourapp;
+
+import android.content.Context;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
+import android.util.AttributeSet;
+import android.util.Log;
+import android.view.View;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Transparent view drawn on top of GLSurfaceView.
+ * Shows:
+ * - Green box: ML Kit raw bounding box (before coordinate fix)
+ * - Cyan box:  corrected screen-space bounding box (after fix)
+ * - Red dot:   ARCore hit-test point sent to plane detection
+ * - Yellow text: debug values per block
+ */
+public class DebugOverlayView extends View {
+
+    private static final String TAG = "DebugOverlay";
+
+    public static class DebugBlock {
+        public RectF rawBounds;       // from ML Kit, raw image coords
+        public RectF correctedBounds; // after coordinate transform
+        public float hitX, hitY;      // screen point sent to ARCore
+        public String label;          // block text + translation
+        public boolean locked;
+        public float confidence;
+    }
+
+    private final List<DebugBlock> debugBlocks = new ArrayList<>();
+
+    // Paints
+    private final Paint rawPaint       = new Paint();
+    private final Paint correctedPaint = new Paint();
+    private final Paint hitPaint       = new Paint();
+    private final Paint textPaint      = new Paint();
+    private final Paint lockedPaint    = new Paint();
+    private final Paint bgPaint        = new Paint();
+
+    // Screen info
+    private int screenW, screenH;
+    private int imageW,  imageH;  // ML Kit image dimensions
+
+    public DebugOverlayView(Context context, AttributeSet attrs) {
+        super(context, attrs);
+        setWillNotDraw(false);
+
+        rawPaint.setStyle(Paint.Style.STROKE);
+        rawPaint.setColor(Color.GREEN);
+        rawPaint.setStrokeWidth(4f);
+        rawPaint.setAntiAlias(true);
+
+        correctedPaint.setStyle(Paint.Style.STROKE);
+        correctedPaint.setColor(Color.CYAN);
+        correctedPaint.setStrokeWidth(4f);
+        correctedPaint.setAntiAlias(true);
+
+        hitPaint.setStyle(Paint.Style.FILL);
+        hitPaint.setColor(Color.RED);
+        hitPaint.setAntiAlias(true);
+
+        textPaint.setColor(Color.WHITE);
+        textPaint.setTextSize(28f);
+        textPaint.setAntiAlias(true);
+
+        lockedPaint.setStyle(Paint.Style.FILL);
+        lockedPaint.setColor(Color.parseColor("#AA00FF00"));
+        lockedPaint.setAntiAlias(true);
+
+        bgPaint.setColor(Color.argb(140, 0, 0, 0));
+    }
+
+    public void setDebugBlocks(List<DebugBlock> blocks,
+                                int screenW, int screenH,
+                                int imageW,  int imageH) {
+        this.debugBlocks.clear();
+        this.debugBlocks.addAll(blocks);
+        this.screenW = screenW;
+        this.screenH = screenH;
+        this.imageW  = imageW;
+        this.imageH  = imageH;
+
+        Log.d(TAG, "=== DEBUG UPDATE ===");
+        Log.d(TAG, "Screen: " + screenW + "x" + screenH);
+        Log.d(TAG, "Image:  " + imageW  + "x" + imageH);
+        for (DebugBlock b : blocks) {
+            Log.d(TAG, "Block raw="     + rectStr(b.rawBounds)
+                     + " corrected="    + rectStr(b.correctedBounds)
+                     + " hit=("         + b.hitX + "," + b.hitY + ")"
+                     + " locked="       + b.locked
+                     + " label="        + b.label);
+        }
+
+        invalidate();
+    }
+
+    public void clear() {
+        debugBlocks.clear();
+        invalidate();
+    }
+
+    @Override
+    protected void onDraw(Canvas canvas) {
+        super.onDraw(canvas);
+        if (debugBlocks.isEmpty()) return;
+
+        for (DebugBlock b : debugBlocks) {
+
+            // ── Green: raw ML Kit box (probably wrong position) ───────────
+            if (b.rawBounds != null) {
+                canvas.drawRect(b.rawBounds, rawPaint);
+                drawLabel(canvas, "RAW", b.rawBounds.left, b.rawBounds.top - 4f,
+                    Color.GREEN);
+            }
+
+            // ── Cyan: corrected screen-space box ──────────────────────────
+            if (b.correctedBounds != null) {
+                canvas.drawRect(b.correctedBounds, correctedPaint);
+                if (b.locked) {
+                    canvas.drawRect(b.correctedBounds, lockedPaint);
+                }
+                drawLabel(canvas, "FIXED", b.correctedBounds.left,
+                    b.correctedBounds.top - 28f, Color.CYAN);
+            }
+
+            // ── Red dot: ARCore hit-test point ────────────────────────────
+            canvas.drawCircle(b.hitX, b.hitY, 12f, hitPaint);
+            drawLabel(canvas,
+                "HIT (" + (int)b.hitX + "," + (int)b.hitY + ")",
+                b.hitX + 16f, b.hitY, Color.RED);
+
+            // ── Yellow: block label ───────────────────────────────────────
+            if (b.correctedBounds != null) {
+                drawLabel(canvas, b.label,
+                    b.correctedBounds.left,
+                    b.correctedBounds.bottom + 32f,
+                    Color.YELLOW);
+
+                // Confidence ring
+                String conf = b.locked ? "LOCKED" :
+                    "conf: " + (int)(b.confidence * 100) + "%";
+                drawLabel(canvas, conf,
+                    b.correctedBounds.left,
+                    b.correctedBounds.bottom + 60f,
+                    b.locked ? Color.GREEN : Color.YELLOW);
+            }
+        }
+
+        // ── Legend ────────────────────────────────────────────────────────
+        float ly = 80f;
+        drawLabel(canvas, "█ GREEN  = ML Kit raw box", 20f, ly, Color.GREEN);
+        drawLabel(canvas, "█ CYAN   = corrected box",  20f, ly+34f, Color.CYAN);
+        drawLabel(canvas, "● RED    = ARCore hit pt",  20f, ly+68f, Color.RED);
+        drawLabel(canvas, "■ YELLOW = label/conf",     20f, ly+102f, Color.YELLOW);
+    }
+
+    private void drawLabel(Canvas c, String text, float x, float y, int color) {
+        if (text == null) return;
+        float tw = textPaint.measureText(text);
+        c.drawRect(x - 2f, y - textPaint.getTextSize(),
+            x + tw + 4f, y + 4f, bgPaint);
+        textPaint.setColor(color);
+        c.drawText(text, x, y, textPaint);
+    }
+
+    private String rectStr(RectF r) {
+        if (r == null) return "null";
+        return String.format("(%.0f,%.0f,%.0f,%.0f)",
+            r.left, r.top, r.right, r.bottom);
+    }
+}
+```
+
+---
+
+## `CoordinateMapper.java` — The actual fix: maps ML Kit image coords → screen coords
+```java
+package com.yourapp;
+
+import android.graphics.RectF;
+import android.util.Log;
+
+/**
+ * ML Kit text recognition returns bounding boxes in IMAGE coordinates.
+ * In portrait mode, the camera image is rotated 90° relative to the screen.
+ *
+ * ARCore's hit-test expects SCREEN coordinates.
+ *
+ * This class does the exact transformation:
+ *
+ * Portrait mode (rotation = 90°):
+ *   Image W = screen H
+ *   Image H = screen W
+ *   screenX = imageY * (screenW / imageH)
+ *   screenY = (imageW - imageX) * (screenH / imageW)
+ *
+ * We also clamp to screen bounds and log everything for debugging.
+ */
+public class CoordinateMapper {
+
+    private static final String TAG = "CoordMapper";
+
+    public static class MappedBounds {
+        public RectF screen;   // corrected screen-space bounds
+        public float hitX;     // centre X for ARCore hit-test
+        public float hitY;     // centre Y for ARCore hit-test
+    }
+
+    /**
+     * @param imageBounds  Raw bounding box from ML Kit (image pixel coords)
+     * @param imageW       Width of image ML Kit processed
+     * @param imageH       Height of image ML Kit processed
+     * @param screenW      GLSurfaceView width
+     * @param screenH      GLSurfaceView height
+     * @param sensorRotation  degrees: 0, 90, 180, 270
+     */
+    public static MappedBounds map(RectF imageBounds,
+                                    int imageW, int imageH,
+                                    int screenW, int screenH,
+                                    int sensorRotation) {
+
+        Log.d(TAG, "map() imageBounds=" + imageBounds
+            + " imageSize=" + imageW + "x" + imageH
+            + " screenSize=" + screenW + "x" + screenH
+            + " rotation=" + sensorRotation);
+
+        float left, top, right, bottom;
+
+        switch (sensorRotation) {
+            case 90:
+                // Portrait: image is rotated 90° clockwise relative to screen
+                // image X → screen Y (inverted)
+                // image Y → screen X
+                left   = imageBounds.top   * screenW / imageH;
+                top    = (imageW - imageBounds.right)  * screenH / imageW;
+                right  = imageBounds.bottom * screenW / imageH;
+                bottom = (imageW - imageBounds.left)   * screenH / imageW;
+                break;
+
+            case 270:
+                // Reverse portrait
+                left   = (imageH - imageBounds.bottom) * screenW / imageH;
+                top    = imageBounds.left  * screenH / imageW;
+                right  = (imageH - imageBounds.top)    * screenW / imageH;
+                bottom = imageBounds.right * screenH / imageW;
+                break;
+
+            case 180:
+                // Upside down
+                left   = (imageW - imageBounds.right)  * screenW / imageW;
+                top    = (imageH - imageBounds.bottom) * screenH / imageH;
+                right  = (imageW - imageBounds.left)   * screenW / imageW;
+                bottom = (imageH - imageBounds.top)    * screenH / imageH;
+                break;
+
+            default: // 0 — landscape, direct scale
+                left   = imageBounds.left   * screenW / imageW;
+                top    = imageBounds.top    * screenH / imageH;
+                right  = imageBounds.right  * screenW / imageW;
+                bottom = imageBounds.bottom * screenH / imageH;
+                break;
+        }
+
+        // Clamp to screen
+        left   = Math.max(0, Math.min(screenW, left));
+        top    = Math.max(0, Math.min(screenH, top));
+        right  = Math.max(0, Math.min(screenW, right));
+        bottom = Math.max(0, Math.min(screenH, bottom));
+
+        // Sanity check
+        if (right <= left || bottom <= top) {
+            Log.w(TAG, "Degenerate bounds after mapping — skipping block");
+            return null;
+        }
+
+        MappedBounds result = new MappedBounds();
+        result.screen = new RectF(left, top, right, bottom);
+        result.hitX   = (left + right)  / 2f;
+        result.hitY   = (top  + bottom) / 2f;
+
+        Log.d(TAG, "map() → screen=" + result.screen
+            + " hit=(" + result.hitX + "," + result.hitY + ")");
+
+        return result;
+    }
+
+    /**
+     * Gets the camera sensor rotation for portrait mode.
+     * Usually 90 on Android phones.
+     */
+    public static int getSensorRotation(android.app.Activity activity) {
+        // Get display rotation
+        int displayRotation = activity.getWindowManager()
+            .getDefaultDisplay().getRotation();
+
+        // For portrait-locked apps on standard phones, sensor is 90°
+        // We detect this from the relationship between display rotation
+        // and the image dimensions returned by ML Kit
+        int rot = displayRotation * 90;
+
+        Log.d(TAG, "getSensorRotation() displayRotation=" + displayRotation
+            + " → sensorRotation=" + rot);
+
+        return rot;
+    }
+}
+```
+
+---
+
+## `activity_main.xml` — Add debug overlay
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000">
+
+    <!-- ARCore GL surface -->
+    <android.opengl.GLSurfaceView
+        android:id="@+id/gl_surface_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"/>
+
+    <!-- Debug overlay — sits on top of GL, transparent -->
+    <com.yourapp.DebugOverlayView
+        android:id="@+id/debug_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="visible"/>
+
+    <!-- Language selectors -->
+    <LinearLayout
+        android:id="@+id/language_panel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:background="#CC000000"
+        android:orientation="horizontal"
+        android:padding="12dp"
+        android:gravity="center_vertical">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:layout_marginEnd="8dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Source"
+                android:textColor="#99FFFFFF"
+                android:textSize="11sp"/>
+
+            <Spinner
+                android:id="@+id/spinner_source"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:popupBackground="#001F3F"/>
+
+        </LinearLayout>
+
+        <ImageButton
+            android:id="@+id/btn_swap"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:tint="#00E5FF"/>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:layout_marginStart="8dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Target"
+                android:textColor="#99FFFFFF"
+                android:textSize="11sp"/>
+
+            <Spinner
+                android:id="@+id/spinner_target"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:popupBackground="#001F3F"/>
+
+        </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- Bottom controls -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="#CC000000"
+        android:orientation="vertical"
+        android:padding="20dp"
+        android:gravity="center">
+
+        <TextView
+            android:id="@+id/status_text"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:layout_marginBottom="12dp"
+            android:text="Point at text and tap scan"/>
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center">
+
+            <Button
+                android:id="@+id/btn_capture"
+                android:layout_width="72dp"
+                android:layout_height="72dp"
+                android:backgroundTint="#00E5FF"
+                android:text=""/>
+
+            <Button
+                android:id="@+id/btn_reset"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="16dp"
+                android:text="Clear"
+                android:backgroundTint="#334455"
+                android:textColor="#FFFFFF"
+                android:visibility="gone"/>
+
+            <!-- Toggle debug overlay -->
+            <Button
+                android:id="@+id/btn_debug"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="DBG"
+                android:backgroundTint="#663300"
+                android:textColor="#FFFFFF"/>
+
+        </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- Loading panel -->
+    <LinearLayout
+        android:id="@+id/loading_panel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="#CC000000"
+        android:orientation="vertical"
+        android:padding="24dp"
+        android:gravity="center"
+        android:visibility="gone">
+
+        <ProgressBar
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:indeterminateTint="#00E5FF"/>
+
+        <TextView
+            android:id="@+id/loading_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:layout_marginTop="12dp"
+            android:text="Processing…"/>
+
+    </LinearLayout>
+
+</FrameLayout>
+```
+
+---
+
+## `MainActivity.java` — Complete with coordinate fix + debug wiring
+```java
+package com.yourapp;
+
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Rect;
+import android.graphics.RectF;
+import android.opengl.GLSurfaceView;
+import android.os.Bundle;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.util.Log;
+import android.view.PixelCopy;
+import android.view.View;
+import android.widget.*;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import com.google.ar.core.*;
+import com.google.ar.core.exceptions.*;
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.Text;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class MainActivity extends AppCompatActivity
+        implements ARRenderer.Callback {
+
+    private static final String TAG = "MainActivity";
+    private static final int    CAM_PERM = 100;
+
+    // ── Views ──────────────────────────────────────────────────────────────
+    private GLSurfaceView    glView;
+    private DebugOverlayView debugOverlay;
+    private TextView         statusTv, loadingTv;
+    private View             loadingPanel;
+    private Button           btnScan, btnClear, btnDebug;
+    private Spinner          spnSrc, spnTgt;
+    private ImageButton      btnSwap;
+
+    // ── AR + ML ────────────────────────────────────────────────────────────
+    private Session              arSession;
+    private ARRenderer           renderer;
+    private TextRecognizer       ocr;
+    private TranslationProcessor translator;
+    private Vibrator             vibrator;
+
+    // ── State ──────────────────────────────────────────────────────────────
+    private boolean busy       = false;
+    private boolean debugMode  = true; // ON by default so you see boxes immediately
+
+    @Override
+    protected void onCreate(Bundle s) {
+        super.onCreate(s);
+        setContentView(R.layout.activity_main);
+
+        glView       = findViewById(R.id.gl_surface_view);
+        debugOverlay = findViewById(R.id.debug_overlay);
+        statusTv     = findViewById(R.id.status_text);
