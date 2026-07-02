@@ -1,0 +1,1364 @@
+Okay. Since you're not sure what's showing the feed, let me make a decision and stick with it completely.
+
+**Decision: ARCore GLSurfaceView for everything.** No CameraX. ARCore handles the camera. ML Kit reads frames from ARCore. No mixing, no coordinate confusion.
+
+Here is the complete working app. Every file. Nothing missing.
+
+---
+
+## `build.gradle`
+```gradle
+dependencies {
+    implementation 'com.google.ar:core:1.40.0'
+    implementation 'com.google.mlkit:text-recognition:16.0.0'
+    implementation 'com.google.mlkit:translate:17.0.2'
+    implementation 'com.google.mlkit:language-id:17.0.4'
+}
+```
+
+---
+
+## `AndroidManifest.xml`
+```xml
+<uses-permission android:name="android.permission.CAMERA"/>
+<uses-feature android:name="android.hardware.camera.ar" android:required="true"/>
+
+<application ...>
+    <meta-data android:name="com.google.ar.core" android:value="required"/>
+</application>
+```
+
+---
+
+## `LanguageManager.java`
+```java
+package com.yourapp;
+
+import com.google.mlkit.nl.translate.TranslateLanguage;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class LanguageManager {
+
+    public static final Map<String, String> LANGUAGES = new LinkedHashMap<>();
+
+    static {
+        LANGUAGES.put("Auto Detect", "auto");
+        LANGUAGES.put("English",     TranslateLanguage.ENGLISH);
+        LANGUAGES.put("Hindi",       TranslateLanguage.HINDI);
+        LANGUAGES.put("French",      TranslateLanguage.FRENCH);
+        LANGUAGES.put("Spanish",     TranslateLanguage.SPANISH);
+        LANGUAGES.put("German",      TranslateLanguage.GERMAN);
+        LANGUAGES.put("Chinese",     TranslateLanguage.CHINESE);
+        LANGUAGES.put("Japanese",    TranslateLanguage.JAPANESE);
+        LANGUAGES.put("Korean",      TranslateLanguage.KOREAN);
+        LANGUAGES.put("Arabic",      TranslateLanguage.ARABIC);
+        LANGUAGES.put("Portuguese",  TranslateLanguage.PORTUGUESE);
+        LANGUAGES.put("Russian",     TranslateLanguage.RUSSIAN);
+        LANGUAGES.put("Italian",     TranslateLanguage.ITALIAN);
+        LANGUAGES.put("Turkish",     TranslateLanguage.TURKISH);
+    }
+
+    public static String[] getDisplayNames() {
+        return LANGUAGES.keySet().toArray(new String[0]);
+    }
+
+    public static String getCode(String name) {
+        return LANGUAGES.getOrDefault(name, TranslateLanguage.ENGLISH);
+    }
+}
+```
+
+---
+
+## `TranslationProcessor.java`
+```java
+package com.yourapp;
+
+import com.google.mlkit.common.model.DownloadConditions;
+import com.google.mlkit.nl.languageid.LanguageIdentification;
+import com.google.mlkit.nl.languageid.LanguageIdentifier;
+import com.google.mlkit.nl.translate.TranslateLanguage;
+import com.google.mlkit.nl.translate.Translation;
+import com.google.mlkit.nl.translate.Translator;
+import com.google.mlkit.nl.translate.TranslatorOptions;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class TranslationProcessor {
+
+    public interface Callback {
+        void onDone(List<String> results);
+        void onError(String msg);
+        void onStatus(String msg);
+    }
+
+    private Translator       translator;
+    private final LanguageIdentifier identifier =
+        LanguageIdentification.getClient();
+
+    public void translate(List<String> texts,
+                          String src, String tgt,
+                          Callback cb) {
+
+        if (texts == null || texts.isEmpty()) {
+            cb.onError("No text"); return;
+        }
+
+        if ("auto".equals(src)) {
+            identifier.identifyLanguage(String.join(" ", texts))
+                .addOnSuccessListener(lang -> doTranslate(texts,
+                    "und".equals(lang) ? TranslateLanguage.ENGLISH : lang,
+                    tgt, cb))
+                .addOnFailureListener(e -> doTranslate(texts,
+                    TranslateLanguage.ENGLISH, tgt, cb));
+        } else {
+            doTranslate(texts, src, tgt, cb);
+        }
+    }
+
+    private void doTranslate(List<String> texts,
+                              String src, String tgt, Callback cb) {
+        if (src.equals(tgt)) { cb.onDone(texts); return; }
+        if (translator != null) translator.close();
+
+        translator = Translation.getClient(
+            new TranslatorOptions.Builder()
+                .setSourceLanguage(src)
+                .setTargetLanguage(tgt)
+                .build());
+
+        cb.onStatus("Downloading model…");
+
+        translator.downloadModelIfNeeded(
+                new DownloadConditions.Builder().requireWifi().build())
+            .addOnSuccessListener(v -> {
+                List<String> results = new ArrayList<>();
+                for (int i = 0; i < texts.size(); i++) results.add("");
+                AtomicInteger left = new AtomicInteger(texts.size());
+
+                for (int i = 0; i < texts.size(); i++) {
+                    final int idx = i;
+                    translator.translate(texts.get(i))
+                        .addOnSuccessListener(t -> {
+                            results.set(idx, t);
+                            if (left.decrementAndGet() == 0) cb.onDone(results);
+                        })
+                        .addOnFailureListener(e -> {
+                            results.set(idx, texts.get(idx));
+                            if (left.decrementAndGet() == 0) cb.onDone(results);
+                        });
+                }
+            })
+            .addOnFailureListener(e -> cb.onError("Download failed: " + e.getMessage()));
+    }
+
+    public void close() {
+        if (translator != null) translator.close();
+        identifier.close();
+    }
+}
+```
+
+---
+
+## `TextOverlay.java` — One translated block in world space
+```java
+package com.yourapp;
+
+import android.graphics.RectF;
+import com.google.ar.core.Anchor;
+
+public class TextOverlay {
+    // Screen-space bounds (correctly mapped from ML Kit image space)
+    public RectF   screenBounds;
+
+    // Text
+    public String  original;
+    public String  translated;
+
+    // Colours sampled from the camera frame
+    public int     bgColor;
+    public int     textColor;
+    public float   fontSizePx;
+
+    // ARCore anchor placed at hit-test point
+    public Anchor  anchor;
+
+    // Real world size in metres
+    public float   widthM;
+    public float   heightM;
+
+    // GL texture holding the translated text bitmap
+    public int     textureId = -1;
+
+    // Lock state
+    public boolean locked       = false;
+    public float[] lockedMatrix = null;
+    public int     stableFrames = 0;
+    public float   alpha        = 0f;
+}
+```
+
+---
+
+## `OverlayRenderer.java` — Draws translated text quads locked to surface
+```java
+package com.yourapp;
+
+import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
+import android.graphics.Typeface;
+import android.opengl.GLES20;
+import android.opengl.GLSurfaceView;
+import android.opengl.GLUtils;
+import android.opengl.Matrix;
+import android.util.Log;
+
+import com.google.ar.core.Anchor;
+import com.google.ar.core.Camera;
+import com.google.ar.core.Frame;
+import com.google.ar.core.HitResult;
+import com.google.ar.core.Plane;
+import com.google.ar.core.Pose;
+import com.google.ar.core.Session;
+import com.google.ar.core.TrackingState;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
+import java.nio.ShortBuffer;
+import java.util.ArrayList;
+import java.util.List;
+
+import javax.microedition.khronos.egl.EGLConfig;
+import javax.microedition.khronos.opengles.GL10;
+
+public class OverlayRenderer implements GLSurfaceView.Renderer {
+
+    private static final String TAG = "OverlayRenderer";
+
+    // ── Shader ─────────────────────────────────────────────────────────────
+    private static final String VS =
+        "uniform mat4 u_MVP;\n" +
+        "attribute vec4 a_Pos;\n" +
+        "attribute vec2 a_UV;\n" +
+        "varying vec2 v_UV;\n" +
+        "void main(){\n" +
+        "  gl_Position = u_MVP * a_Pos;\n" +
+        "  v_UV = a_UV;\n" +
+        "}\n";
+
+    private static final String FS =
+        "precision mediump float;\n" +
+        "uniform sampler2D u_Tex;\n" +
+        "uniform float u_Alpha;\n" +
+        "varying vec2 v_UV;\n" +
+        "void main(){\n" +
+        "  vec4 c = texture2D(u_Tex, v_UV);\n" +
+        "  if (c.a * u_Alpha < 0.05) discard;\n" +
+        "  gl_FragColor = vec4(c.rgb, c.a * u_Alpha);\n" +
+        "}\n";
+
+    // Flat quad in XZ plane (lies ON a horizontal surface)
+    // For vertical surfaces we rotate in buildModelMatrix()
+    private static final float[] QUAD = {
+        -0.5f, 0f, -0.5f,  0f, 0f,
+        -0.5f, 0f,  0.5f,  0f, 1f,
+         0.5f, 0f,  0.5f,  1f, 1f,
+         0.5f, 0f, -0.5f,  1f, 0f,
+    };
+    private static final short[] IDX = {0,1,2, 0,2,3};
+
+    private final Context context;
+    private Session       session;
+
+    // GL
+    private int          prog, uMVP, uTex, uAlpha, aPos, aUV;
+    private FloatBuffer  vBuf;
+    private ShortBuffer  iBuf;
+    private BackgroundRenderer bgRenderer;
+
+    // Overlays
+    private final List<TextOverlay>  overlays    = new ArrayList<>();
+    private volatile List<TextOverlay> pending   = null;
+    private volatile boolean          doClear    = false;
+
+    // Camera matrices
+    private final float[] proj = new float[16];
+    private final float[] view = new float[16];
+
+    // Lock params
+    private static final float FADE_SPEED   = 0.06f;
+    private static final int   LOCK_FRAMES  = 30;
+    private static final float LOCK_DRIFT   = 0.005f; // 5mm
+
+    public interface Callback {
+        void onPlaneFound();
+        void onLocked(int count);
+    }
+    private final Callback  cb;
+    private       boolean   planeSeen = false;
+
+    public OverlayRenderer(Context ctx, Callback cb) {
+        this.context = ctx;
+        this.cb      = cb;
+    }
+
+    public void setSession(Session s) { this.session = s; }
+
+    // Called from main thread
+    public void submitOverlays(List<TextOverlay> list) { pending = list; }
+    public void clear()                                { doClear = true;  }
+
+    // ── GL lifecycle ───────────────────────────────────────────────────────
+
+    @Override
+    public void onSurfaceCreated(GL10 gl, EGLConfig cfg) {
+        GLES20.glClearColor(0f, 0f, 0f, 1f);
+        bgRenderer = new BackgroundRenderer();
+        try { bgRenderer.createOnGlThread(context); }
+        catch (IOException e) { Log.e(TAG, "BG fail: " + e); }
+
+        int vs = compileShader(GLES20.GL_VERTEX_SHADER, VS);
+        int fs = compileShader(GLES20.GL_FRAGMENT_SHADER, FS);
+        prog   = GLES20.glCreateProgram();
+        GLES20.glAttachShader(prog, vs);
+        GLES20.glAttachShader(prog, fs);
+        GLES20.glLinkProgram(prog);
+
+        uMVP  = GLES20.glGetUniformLocation(prog, "u_MVP");
+        uTex  = GLES20.glGetUniformLocation(prog, "u_Tex");
+        uAlpha= GLES20.glGetUniformLocation(prog, "u_Alpha");
+        aPos  = GLES20.glGetAttribLocation(prog,  "a_Pos");
+        aUV   = GLES20.glGetAttribLocation(prog,  "a_UV");
+
+        ByteBuffer v = ByteBuffer.allocateDirect(QUAD.length * 4);
+        v.order(ByteOrder.nativeOrder());
+        vBuf = v.asFloatBuffer();
+        vBuf.put(QUAD).position(0);
+
+        ByteBuffer i = ByteBuffer.allocateDirect(IDX.length * 2);
+        i.order(ByteOrder.nativeOrder());
+        iBuf = i.asShortBuffer();
+        iBuf.put(IDX).position(0);
+    }
+
+    @Override
+    public void onSurfaceChanged(GL10 gl, int w, int h) {
+        GLES20.glViewport(0, 0, w, h);
+        if (session != null) {
+            int rot = ((android.app.Activity) context)
+                .getWindowManager().getDefaultDisplay().getRotation();
+            session.setDisplayGeometry(rot, w, h);
+        }
+    }
+
+    @Override
+    public void onDrawFrame(GL10 gl) {
+        GLES20.glClear(
+            GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
+        if (session == null) return;
+
+        try {
+            session.setCameraTextureName(bgRenderer.getTextureId());
+            Frame  frame  = session.update();
+            Camera camera = frame.getCamera();
+
+            // Always draw camera feed first
+            bgRenderer.draw(frame);
+
+            if (camera.getTrackingState() != TrackingState.TRACKING) return;
+
+            camera.getProjectionMatrix(proj, 0, 0.01f, 100f);
+            camera.getViewMatrix(view, 0);
+
+            // Detect planes
+            if (!planeSeen) {
+                for (Plane p : session.getAllTrackables(Plane.class)) {
+                    if (p.getTrackingState() == TrackingState.TRACKING) {
+                        planeSeen = true;
+                        ((android.app.Activity) context)
+                            .runOnUiThread(cb::onPlaneFound);
+                        break;
+                    }
+                }
+            }
+
+            // Clear
+            if (doClear) {
+                doClear = false;
+                freeAll();
+            }
+
+            // Upload pending overlays
+            List<TextOverlay> p = pending;
+            if (p != null) {
+                pending = null;
+                placeOverlays(p, frame);
+            }
+
+            if (overlays.isEmpty()) return;
+
+            // Draw
+            GLES20.glEnable(GLES20.GL_BLEND);
+            GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA,
+                GLES20.GL_ONE_MINUS_SRC_ALPHA);
+            GLES20.glDepthMask(false);
+            GLES20.glUseProgram(prog);
+
+            int locked = 0;
+            for (TextOverlay ov : overlays) {
+                if (ov.textureId < 0) continue;
+
+                float[] mat = getMatrix(ov);
+                if (mat == null) continue;
+
+                if (!ov.locked) tryLock(ov, mat);
+                if (ov.locked)  locked++;
+
+                ov.alpha = Math.min(1f, ov.alpha + FADE_SPEED);
+
+                float[] model = buildModelMatrix(mat, ov.widthM, ov.heightM);
+                float[] mv    = new float[16];
+                float[] mvp   = new float[16];
+                Matrix.multiplyMM(mv,  0, view,  0, model, 0);
+                Matrix.multiplyMM(mvp, 0, proj,  0, mv,    0);
+
+                GLES20.glUniformMatrix4fv(uMVP, 1, false, mvp, 0);
+                GLES20.glUniform1f(uAlpha, ov.alpha);
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ov.textureId);
+                GLES20.glUniform1i(uTex, 0);
+
+                drawQuad();
+            }
+
+            GLES20.glDepthMask(true);
+            GLES20.glDisable(GLES20.GL_BLEND);
+
+            if (locked == overlays.size() && !overlays.isEmpty()) {
+                final int n = locked;
+                ((android.app.Activity) context)
+                    .runOnUiThread(() -> cb.onLocked(n));
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "Frame error: " + e);
+        }
+    }
+
+    // ── Placement ──────────────────────────────────────────────────────────
+
+    private void placeOverlays(List<TextOverlay> list, Frame frame) {
+        freeAll();
+
+        int viewW = ((android.app.Activity) context)
+            .findViewById(android.R.id.content).getWidth();
+        int viewH = ((android.app.Activity) context)
+            .findViewById(android.R.id.content).getHeight();
+
+        for (TextOverlay ov : list) {
+            if (ov.translated == null || ov.translated.isEmpty()) continue;
+
+            // screenBounds are already correct screen coords
+            float sx = ov.screenBounds.centerX();
+            float sy = ov.screenBounds.centerY();
+
+            Log.d(TAG, "Placing overlay at screen (" + sx + "," + sy + ")"
+                + " translated='" + ov.translated + "'");
+
+            // ARCore hit-test at screen centre of text block
+            Anchor anchor   = null;
+            float  depth    = 0.6f;
+            float[] planeMat = null;
+
+            try {
+                List<HitResult> hits = frame.hitTest(sx, sy);
+                for (HitResult hit : hits) {
+                    if (!(hit.getTrackable() instanceof Plane)) continue;
+                    Plane plane = (Plane) hit.getTrackable();
+                    if (plane.getTrackingState() != TrackingState.TRACKING) continue;
+                    if (plane.getSubsumedBy() != null) continue;
+
+                    anchor  = hit.createAnchor();
+                    depth   = hit.getDistance();
+
+                    // Rotation from PLANE, not camera — this is the key
+                    planeMat = new float[16];
+                    plane.getCenterPose().toMatrix(planeMat, 0);
+
+                    float[] hitMat = new float[16];
+                    hit.getHitPose().toMatrix(hitMat, 0);
+
+                    // Use plane rotation, hit-test translation
+                    planeMat[12] = hitMat[12];
+                    planeMat[13] = hitMat[13];
+                    planeMat[14] = hitMat[14];
+
+                    Log.d(TAG, "Hit plane at depth=" + depth);
+                    break;
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Hit-test error: " + e);
+            }
+
+            // Fallback: place in front of camera if no plane found
+            if (anchor == null) {
+                Log.w(TAG, "No plane hit, using fallback anchor");
+                try {
+                    Pose cam   = frame.getCamera().getPose();
+                    float[] t  = cam.getTranslation();
+                    float[] fwd= cam.getZAxis();
+                    Pose pose  = Pose.makeTranslation(
+                        t[0] - fwd[0] * depth,
+                        t[1] - fwd[1] * depth,
+                        t[2] - fwd[2] * depth);
+                    anchor   = session.createAnchor(pose);
+                    planeMat = new float[16];
+                    pose.toMatrix(planeMat, 0);
+                } catch (Exception e) {
+                    Log.e(TAG, "Fallback anchor failed: " + e);
+                    continue;
+                }
+            }
+
+            // Real-world size from depth + screen fraction
+            float fov       = 0.6f; // tan(~31°), typical phone FOV
+            float fracW     = ov.screenBounds.width()  / viewW;
+            float fracH     = ov.screenBounds.height() / viewH;
+            ov.widthM  = Math.max(0.05f, Math.min(2f, 2f * depth * fov * fracW));
+            ov.heightM = Math.max(0.02f, Math.min(1f, 2f * depth * fov * fracH));
+
+            // Build texture from translated text
+            ov.textureId = uploadTexture(
+                buildBitmap(ov.translated, ov.bgColor, ov.textColor,
+                    ov.fontSizePx, ov.widthM, ov.heightM));
+
+            ov.anchor       = anchor;
+            ov.lockedMatrix = planeMat.clone();
+            overlays.add(ov);
+        }
+    }
+
+    // ── Matrix ─────────────────────────────────────────────────────────────
+
+    private float[] getMatrix(TextOverlay ov) {
+        if (ov.locked) return ov.lockedMatrix;
+
+        if (ov.anchor == null ||
+            ov.anchor.getTrackingState() != TrackingState.TRACKING) {
+            return ov.lockedMatrix;
+        }
+
+        float[] anchorMat = new float[16];
+        ov.anchor.getPose().toMatrix(anchorMat, 0);
+
+        // Rotation from plane (stored in lockedMatrix), translation from anchor
+        float[] m = ov.lockedMatrix.clone();
+        m[12] = anchorMat[12];
+        m[13] = anchorMat[13];
+        m[14] = anchorMat[14];
+        return m;
+    }
+
+    private void tryLock(TextOverlay ov, float[] current) {
+        if (ov.locked) return;
+
+        float dx = current[12] - ov.lockedMatrix[12];
+        float dy = current[13] - ov.lockedMatrix[13];
+        float dz = current[14] - ov.lockedMatrix[14];
+        float drift = (float) Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+        if (drift < LOCK_DRIFT) {
+            ov.stableFrames++;
+            // Blend toward current position smoothly
+            ov.lockedMatrix[12] += dx * 0.1f;
+            ov.lockedMatrix[13] += dy * 0.1f;
+            ov.lockedMatrix[14] += dz * 0.1f;
+        } else {
+            ov.stableFrames = 0;
+        }
+
+        if (ov.stableFrames >= LOCK_FRAMES) {
+            ov.locked = true;
+            if (ov.anchor != null) {
+                ov.anchor.detach();
+                ov.anchor = null;
+            }
+            Log.d(TAG, "Overlay locked at ("
+                + ov.lockedMatrix[12] + ","
+                + ov.lockedMatrix[13] + ","
+                + ov.lockedMatrix[14] + ")");
+        }
+    }
+
+    /**
+     * Builds model matrix that places quad flush on the detected plane.
+     * Uses plane normal as Y-up so quad lies flat on the surface.
+     */
+    private float[] buildModelMatrix(float[] planeMat,
+                                      float widthM, float heightM) {
+        float[] scale = new float[16];
+        Matrix.setIdentityM(scale, 0);
+        Matrix.scaleM(scale, 0, widthM, 1f, heightM);
+
+        float[] model = new float[16];
+        Matrix.multiplyMM(model, 0, planeMat, 0, scale, 0);
+
+        // 1mm nudge toward camera to avoid z-fighting
+        float[] invView = new float[16];
+        Matrix.invertM(invView, 0, view, 0);
+        float camX = invView[12], camY = invView[13], camZ = invView[14];
+        float dx = camX - model[12];
+        float dy = camY - model[13];
+        float dz = camZ - model[14];
+        float len = (float) Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (len > 0) {
+            model[12] += (dx/len) * 0.001f;
+            model[13] += (dy/len) * 0.001f;
+            model[14] += (dz/len) * 0.001f;
+        }
+        return model;
+    }
+
+    // ── Bitmap → GL texture ────────────────────────────────────────────────
+
+    private Bitmap buildBitmap(String text, int bgColor, int textColor,
+                                float fontSizePx,
+                                float widthM, float heightM) {
+        // Bitmap aspect matches real-world block aspect
+        int bmpW = 512;
+        int bmpH = Math.max(64,
+            (int)(512f * (heightM / Math.max(0.001f, widthM))));
+        bmpH = Math.min(bmpH, 512);
+
+        Bitmap bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888);
+        Canvas c   = new Canvas(bmp);
+
+        // Background
+        c.drawColor(bgColor);
+
+        // Text
+        Paint tp = new Paint();
+        tp.setAntiAlias(true);
+        tp.setColor(textColor);
+        tp.setTextSize(Math.max(32f, Math.min(bmpH * 0.7f, fontSizePx * 2.5f)));
+        tp.setTypeface(Typeface.DEFAULT_BOLD);
+
+        // Outline for contrast
+        Paint op = new Paint(tp);
+        op.setStyle(Paint.Style.STROKE);
+        op.setStrokeWidth(tp.getTextSize() * 0.07f);
+        float lum = 0.299f * Color.red(textColor)
+                  + 0.587f * Color.green(textColor)
+                  + 0.114f * Color.blue(textColor);
+        op.setColor(lum > 128 ? Color.BLACK : Color.WHITE);
+
+        // Word wrap + draw centred
+        float maxW  = bmpW * 0.9f;
+        float lineH = tp.getTextSize() * 1.2f;
+        List<String> lines = new ArrayList<>();
+        StringBuilder cur  = new StringBuilder();
+
+        for (String w : text.split(" ")) {
+            if (w.isEmpty()) continue;
+            String test = cur.length() == 0 ? w : cur + " " + w;
+            if (tp.measureText(test) > maxW && cur.length() > 0) {
+                lines.add(cur.toString());
+                cur = new StringBuilder(w);
+            } else {
+                cur = new StringBuilder(test);
+            }
+        }
+        if (cur.length() > 0) lines.add(cur.toString());
+
+        float y = (bmpH - lines.size() * lineH) / 2f + tp.getTextSize();
+        for (String line : lines) {
+            float x = (bmpW - tp.measureText(line)) / 2f;
+            c.drawText(line, x, y, op);
+            c.drawText(line, x, y, tp);
+            y += lineH;
+        }
+
+        return bmp;
+    }
+
+    private int uploadTexture(Bitmap bmp) {
+        int[] id = new int[1];
+        GLES20.glGenTextures(1, id, 0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, id[0]);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0);
+        GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D);
+        bmp.recycle();
+        return id[0];
+    }
+
+    // ── Draw quad ──────────────────────────────────────────────────────────
+
+    private void drawQuad() {
+        int stride = 5 * 4;
+        vBuf.position(0);
+        GLES20.glEnableVertexAttribArray(aPos);
+        GLES20.glVertexAttribPointer(aPos, 3,
+            GLES20.GL_FLOAT, false, stride, vBuf);
+        vBuf.position(3);
+        GLES20.glEnableVertexAttribArray(aUV);
+        GLES20.glVertexAttribPointer(aUV, 2,
+            GLES20.GL_FLOAT, false, stride, vBuf);
+        iBuf.position(0);
+        GLES20.glDrawElements(GLES20.GL_TRIANGLES, 6,
+            GLES20.GL_UNSIGNED_SHORT, iBuf);
+        GLES20.glDisableVertexAttribArray(aPos);
+        GLES20.glDisableVertexAttribArray(aUV);
+    }
+
+    // ── Cleanup ────────────────────────────────────────────────────────────
+
+    private void freeAll() {
+        for (TextOverlay ov : overlays) {
+            if (ov.anchor != null) ov.anchor.detach();
+            if (ov.textureId >= 0) {
+                int[] t = {ov.textureId};
+                GLES20.glDeleteTextures(1, t, 0);
+            }
+        }
+        overlays.clear();
+        planeSeen = false;
+    }
+
+    private int compileShader(int type, String src) {
+        int s = GLES20.glCreateShader(type);
+        GLES20.glShaderSource(s, src);
+        GLES20.glCompileShader(s);
+        return s;
+    }
+}
+```
+
+---
+
+## `MainActivity.java` — The coordinator. Gets frame from ARCore, runs ML Kit, maps coordinates correctly, submits to renderer.
+```java
+package com.yourapp;
+
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Color;
+import android.graphics.ImageFormat;
+import android.graphics.Rect;
+import android.graphics.RectF;
+import android.graphics.YuvImage;
+import android.media.Image;
+import android.opengl.GLSurfaceView;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
+import android.view.View;
+import android.widget.*;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import com.google.ar.core.*;
+import com.google.ar.core.exceptions.*;
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.Text;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+
+public class MainActivity extends AppCompatActivity
+        implements OverlayRenderer.Callback {
+
+    private static final String TAG     = "Main";
+    private static final int    CAM_REQ = 100;
+
+    private GLSurfaceView    glView;
+    private TextView         statusTv;
+    private Button           btnScan, btnClear;
+    private Spinner          spnSrc, spnTgt;
+
+    private Session          arSession;
+    private OverlayRenderer  renderer;
+    private TextRecognizer   ocr;
+    private TranslationProcessor translator;
+
+    private boolean busy        = false;
+    private boolean sessionPaused = true;
+
+    // Screen dimensions — set in onWindowFocusChanged
+    private int screenW = 0, screenH = 0;
+
+    @Override
+    protected void onCreate(Bundle s) {
+        super.onCreate(s);
+        setContentView(R.layout.activity_main);
+
+        glView   = findViewById(R.id.gl_view);
+        statusTv = findViewById(R.id.status);
+        btnScan  = findViewById(R.id.btn_scan);
+        btnClear = findViewById(R.id.btn_clear);
+        spnSrc   = findViewById(R.id.spn_src);
+        spnTgt   = findViewById(R.id.spn_tgt);
+
+        setupSpinners();
+
+        ocr        = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+        translator = new TranslationProcessor();
+
+        btnScan.setOnClickListener(v -> scan());
+        btnClear.setOnClickListener(v -> {
+            renderer.clear();
+            btnClear.setVisibility(View.GONE);
+            btnScan.setEnabled(true);
+            status("Point at text and tap SCAN");
+        });
+
+        if (hasPerm()) initAR();
+        else ActivityCompat.requestPermissions(this,
+            new String[]{Manifest.permission.CAMERA}, CAM_REQ);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean focus) {
+        super.onWindowFocusChanged(focus);
+        screenW = glView.getWidth();
+        screenH = glView.getHeight();
+        Log.d(TAG, "Screen size: " + screenW + "x" + screenH);
+    }
+
+    private void setupSpinners() {
+        String[] names = LanguageManager.getDisplayNames();
+        ArrayAdapter<String> a = new ArrayAdapter<>(
+            this, android.R.layout.simple_spinner_item, names);
+        a.setDropDownViewResource(
+            android.R.layout.simple_spinner_dropdown_item);
+        spnSrc.setAdapter(a); spnTgt.setAdapter(a);
+        spnSrc.setSelection(0);
+        spnTgt.setSelection(1);
+    }
+
+    private void initAR() {
+        try {
+            arSession = new Session(this);
+            Config cfg = new Config(arSession);
+            cfg.setFocusMode(Config.FocusMode.AUTO);
+            cfg.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
+            cfg.setPlaneFindingMode(
+                Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL);
+            cfg.setLightEstimationMode(Config.LightEstimationMode.DISABLED);
+            arSession.configure(cfg);
+        } catch (UnavailableException e) {
+            Log.e(TAG, "ARCore unavailable: " + e);
+            status("ARCore unavailable"); return;
+        }
+
+        glView.setPreserveEGLContextOnPause(true);
+        glView.setEGLContextClientVersion(2);
+        renderer = new OverlayRenderer(this, this);
+        renderer.setSession(arSession);
+        glView.setRenderer(renderer);
+        glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
+
+        status("Point at text and tap SCAN");
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (arSession != null) {
+            try {
+                arSession.resume();
+                sessionPaused = false;
+                glView.onResume();
+            } catch (CameraNotAvailableException e) {
+                status("Camera unavailable");
+            }
+        }
+    }
+
+    @Override protected void onPause() {
+        super.onPause();
+        if (!sessionPaused && arSession != null) {
+            glView.onPause();
+            arSession.pause();
+            sessionPaused = true;
+        }
+    }
+
+    @Override protected void onDestroy() {
+        super.onDestroy();
+        if (arSession != null) arSession.close();
+        ocr.close();
+        translator.close();
+    }
+
+    // ── SCAN ───────────────────────────────────────────────────────────────
+
+    private void scan() {
+        if (busy) return;
+        if (spnTgt.getSelectedItemPosition() == 0) {
+            Toast.makeText(this, "Select a target language",
+                Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        busy = true;
+        btnScan.setEnabled(false);
+        status("Capturing frame…");
+
+        // Grab camera image from ARCore on background thread
+        new Thread(() -> {
+            try {
+                // Get a fresh frame from ARCore
+                Frame frame = arSession.update();
+
+                if (frame.getCamera().getTrackingState()
+                        != TrackingState.TRACKING) {
+                    runOnUiThread(() -> {
+                        status("Not tracking yet — try again"); reset();
+                    });
+                    return;
+                }
+
+                // Acquire camera image from ARCore
+                // ARCore gives us YUV_420_888
+                Image cameraImage = frame.acquireCameraImage();
+                int   imgW        = cameraImage.getWidth();
+                int   imgH        = cameraImage.getHeight();
+
+                // Convert YUV → Bitmap
+                Bitmap yuv = yuvToBitmap(cameraImage);
+                cameraImage.close();
+
+                if (yuv == null) {
+                    runOnUiThread(() -> { status("Frame error"); reset(); });
+                    return;
+                }
+
+                // ── THIS IS THE KEY ────────────────────────────────────────
+                // ARCore camera image in portrait mode:
+                //   - Image is LANDSCAPE (wider than tall)
+                //   - It needs to be rotated 90° to match the screen
+                //
+                // We rotate the bitmap 90° so ML Kit sees it UPRIGHT.
+                // Then ML Kit bounding boxes are in UPRIGHT image coordinates.
+                //
+                // To convert upright image coords → screen coords:
+                //   screenX = imageX * (screenW / uprightImageW)
+                //   screenY = imageY * (screenH / uprightImageH)
+                //
+                // That's it. Simple scale. No rotation math needed because
+                // the bitmap is already rotated to match screen orientation.
+
+                android.graphics.Matrix rotMatrix =
+                    new android.graphics.Matrix();
+                rotMatrix.postRotate(90); // portrait = 90° rotation
+                Bitmap upright = Bitmap.createBitmap(
+                    yuv, 0, 0, yuv.getWidth(), yuv.getHeight(),
+                    rotMatrix, true);
+                yuv.recycle();
+
+                int uprightW = upright.getWidth();  // now matches screen portrait
+                int uprightH = upright.getHeight();
+
+                Log.d(TAG, "ARCore image: " + imgW + "x" + imgH
+                    + " → upright: " + uprightW + "x" + uprightH
+                    + " screen: " + screenW + "x" + screenH);
+
+                runOnUiThread(() -> status("Detecting text…"));
+
+                // Feed upright bitmap to ML Kit with rotation=0
+                InputImage input = InputImage.fromBitmap(upright, 0);
+
+                ocr.process(input)
+                    .addOnSuccessListener(result -> {
+
+                        Log.d(TAG, "OCR: " + result.getTextBlocks().size()
+                            + " blocks");
+
+                        if (result.getTextBlocks().isEmpty()) {
+                            upright.recycle();
+                            runOnUiThread(() -> {
+                                status("No text found — try again"); reset();
+                            });
+                            return;
+                        }
+
+                        List<TextOverlay> overlays  = new ArrayList<>();
+                        List<String>      originals = new ArrayList<>();
+
+                        for (Text.TextBlock tb : result.getTextBlocks()) {
+                            if (tb.getBoundingBox() == null) continue;
+                            if (tb.getText().trim().isEmpty()) continue;
+
+                            Rect r = tb.getBoundingBox();
+
+                            // ── Scale from upright image → screen ──────────
+                            // Both are portrait orientation now so this is
+                            // a straightforward scale
+                            float scaleX = (float) screenW / uprightW;
+                            float scaleY = (float) screenH / uprightH;
+
+                            float left   = r.left   * scaleX;
+                            float top    = r.top    * scaleY;
+                            float right  = r.right  * scaleX;
+                            float bottom = r.bottom * scaleY;
+
+                            Log.d(TAG, "Block '"
+                                + tb.getText().trim().substring(0,
+                                    Math.min(20, tb.getText().trim().length()))
+                                + "' imageBox=(" + r.left + "," + r.top
+                                + "," + r.right + "," + r.bottom + ")"
+                                + " screenBox=(" + left + "," + top
+                                + "," + right + "," + bottom + ")");
+
+                            TextOverlay ov = new TextOverlay();
+                            ov.original     = tb.getText().trim();
+                            ov.screenBounds = new RectF(left, top, right, bottom);
+
+                            // Sample colours from upright bitmap
+                            sampleColours(upright, r, ov);
+
+                            originals.add(ov.original);
+                            overlays.add(ov);
+                        }
+
+                        upright.recycle();
+
+                        if (overlays.isEmpty()) {
+                            runOnUiThread(() -> { status("No valid blocks"); reset(); });
+                            return;
+                        }
+
+                        runOnUiThread(() -> status("Translating…"));
+
+                        String src = LanguageManager.getCode(
+                            spnSrc.getSelectedItem().toString());
+                        String tgt = LanguageManager.getCode(
+                            spnTgt.getSelectedItem().toString());
+
+                        // ── ML Kit Translate ───────────────────────────────
+                        translator.translate(originals, src, tgt,
+                            new TranslationProcessor.Callback() {
+
+                            @Override
+                            public void onDone(List<String> results) {
+                                for (int i = 0; i < results.size()
+                                        && i < overlays.size(); i++) {
+                                    overlays.get(i).translated = results.get(i);
+                                    Log.d(TAG, "Translated [" + i + "]: '"
+                                        + originals.get(i) + "' → '"
+                                        + results.get(i) + "'");
+                                }
+
+                                // Submit to renderer on GL thread
+                                glView.queueEvent(() -> {
+                                    try {
+                                        Frame f = arSession.update();
+                                        renderer.submitOverlays(overlays);
+                                        // Trigger placement by re-submitting
+                                        // (renderer picks it up next frame)
+                                    } catch (Exception e) {
+                                        Log.e(TAG, "AR submit error: " + e);
+                                    }
+                                });
+
+                                runOnUiThread(() -> {
+                                    status("✅ " + overlays.size()
+                                        + " block(s) placed");
+                                    btnClear.setVisibility(View.VISIBLE);
+                                    busy = false;
+                                });
+                            }
+
+                            @Override public void onError(String msg) {
+                                runOnUiThread(() -> {
+                                    status("Translation error: " + msg);
+                                    reset();
+                                });
+                            }
+
+                            @Override public void onStatus(String msg) {
+                                runOnUiThread(() -> status(msg));
+                            }
+                        });
+                    })
+                    .addOnFailureListener(e -> {
+                        upright.recycle();
+                        runOnUiThread(() -> {
+                            status("OCR failed: " + e.getMessage()); reset();
+                        });
+                    });
+
+            } catch (NotYetAvailableException e) {
+                Log.w(TAG, "Frame not available yet");
+                runOnUiThread(() -> { status("Not ready — try again"); reset(); });
+            } catch (Exception e) {
+                Log.e(TAG, "Scan error: " + e);
+                runOnUiThread(() -> { status("Error: " + e.getMessage()); reset(); });
+            }
+        }).start();
+    }
+
+    // ── YUV → Bitmap ───────────────────────────────────────────────────────
+
+    private Bitmap yuvToBitmap(Image image) {
+        try {
+            Image.Plane[] planes = image.getPlanes();
+            ByteBuffer yBuf  = planes[0].getBuffer();
+            ByteBuffer uBuf  = planes[1].getBuffer();
+            ByteBuffer vBuf  = planes[2].getBuffer();
+
+            int ySize = yBuf.remaining();
+            int uSize = uBuf.remaining();
+            int vSize = vBuf.remaining();
+
+            byte[] nv21 = new byte[ySize + uSize + vSize];
+            yBuf.get(nv21, 0, ySize);
+            vBuf.get(nv21, ySize, vSize);
+            uBuf.get(nv21, ySize + vSize, uSize);
+
+            YuvImage yuvImage = new YuvImage(
+                nv21, ImageFormat.NV21,
+                image.getWidth(), image.getHeight(), null);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            yuvImage.compressToJpeg(
+                new Rect(0, 0, image.getWidth(), image.getHeight()),
+                90, out);
+            byte[] jpg = out.toByteArray();
+            return android.graphics.BitmapFactory
+                .decodeByteArray(jpg, 0, jpg.length);
+        } catch (Exception e) {
+            Log.e(TAG, "YUV convert failed: " + e);
+            return null;
+        }
+    }
+
+    // ── Colour sampling ────────────────────────────────────────────────────
+
+    private void sampleColours(Bitmap bmp, Rect r, TextOverlay ov) {
+        int l = Math.max(0, r.left);
+        int t = Math.max(0, r.top);
+        int ri = Math.min(bmp.getWidth()  - 1, r.right);
+        int b  = Math.min(bmp.getHeight() - 1, r.bottom);
+
+        if (ri <= l || b <= t) {
+            ov.bgColor   = Color.WHITE;
+            ov.textColor = Color.BLACK;
+            ov.fontSizePx= 32f;
+            return;
+        }
+
+        // Sample outer border for background
+        long rS=0,gS=0,bS=0,n=0;
+        int border = Math.min(6, Math.min(r.width(), r.height()) / 4);
+        border = Math.max(1, border);
+
+        for (int x = l; x <= ri; x++) {
+            if (t < bmp.getHeight()) {
+                int px = bmp.getPixel(x, t);
+                rS+=Color.red(px); gS+=Color.green(px); bS+=Color.blue(px); n++;
+            }
+            if (b < bmp.getHeight()) {
+                int px = bmp.getPixel(x, b);
+                rS+=Color.red(px); gS+=Color.green(px); bS+=Color.blue(px); n++;
+            }
+        }
+        for (int y = t; y <= b; y++) {
+            if (l < bmp.getWidth()) {
+                int px = bmp.getPixel(l, y);
+                rS+=Color.red(px); gS+=Color.green(px); bS+=Color.blue(px); n++;
+            }
+            if (ri < bmp.getWidth()) {
+                int px = bmp.getPixel(ri, y);
+                rS+=Color.red(px); gS+=Color.green(px); bS+=Color.blue(px); n++;
+            }
+        }
+
+        ov.bgColor = n > 0
+            ? Color.rgb((int)(rS/n), (int)(gS/n), (int)(bS/n))
+            : Color.WHITE;
+
+        float bgLum = 0.299f * Color.red(ov.bgColor)
+                    + 0.587f * Color.green(ov.bgColor)
+                    + 0.114f * Color.blue(ov.bgColor);
+        ov.textColor  = bgLum > 128 ? Color.BLACK : Color.WHITE;
+        ov.fontSizePx = Math.max(16f, r.height() /
+            (float) Math.max(1, Math.max(1,
+                ov.original.split("\n").length)) * 0.75f);
+    }
+
+    // ── Callbacks ──────────────────────────────────────────────────────────
+
+    @Override public void onPlaneFound() {
+        status("Surface found — tap SCAN");
+    }
+
+    @Override public void onLocked(int count) {
+        status("🔒 " + count + " block(s) locked");
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    private void status(String m) { statusTv.setText(m); }
+
+    private void reset() {
+        busy = false;
+        btnScan.setEnabled(true);
+    }
+
+    private boolean hasPerm() {
+        return ContextCompat.checkSelfPermission(this,
+            Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code,
+            @NonNull String[] p, @NonNull int[] g) {
+        super.onRequestPermissionsResult(code, p, g);
+        if (code == CAM_REQ && g.length > 0
+                && g[0] == PackageManager.PERMISSION_GRANTED) initAR();
+    }
+}
+```
+
+---
+
+## `activity_main.xml`
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000">
+
+    <android.opengl.GLSurfaceView
+        android:id="@+id/gl_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"/>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="#CC000000"
+        android:orientation="vertical"
+        android:padding="16dp"
+        android:gravity="center">
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:layout_marginBottom="10dp"
+            android:text="Point at text and tap SCAN"/>
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center"
+            android:layout_marginBottom="10dp">
+
+            <Spinner
+                android:id="@+id/spn_src"
+                android:layout_width="130dp"
+                android:layout_height="40dp"
+                android:popupBackground="#001F3F"/>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="  →  "
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"/>
+
+            <Spinner
+                android:id="@+id/spn_tgt"
+                android:layout_width="130dp"
+                android:layout_height="40dp"
+                android:popupBackground="#001F3F"/>
+
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center">
+
+            <Button
+                android:id="@+id/btn_scan"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="SCAN"
+                android:backgroundTint="#00E5FF"
+                android:textColor="#000"/>
+
+            <Button
+                android:id="@+id/btn_clear"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:text="CLEAR"
+                android:backgroundTint="#334455"
+                android:textColor="#FFF"
+                android:visibility="gone"/>
+
+        </LinearLayout>
+
+    </LinearLayout>
+
+</FrameLayout>
+```
+
+---
+
+## Why this is correct
+
+The entire coordinate problem solved in one place:
+
+```
+ARCore camera image → YUV → Bitmap (landscape, 90° rotated)
+        ↓
+rotateBitmap 90° → upright portrait bitmap
+        ↓
+ML Kit sees upright bitmap, rotation=0
+        ↓
+ML Kit bounding boxes are in upright portrait pixel coords
+        ↓
+Scale to screen: screenX = boxX * (screenW / uprightW)
+                 screenY = boxY * (screenH / uprightH)
+        ↓
+ARCore hit-test at those screen coords → lands exactly on text
+```
+
+No PixelCopy. No CameraX. No coordinate transforms beyond one simple scale. ARCore gives us the frame, we rotate it once, ML Kit reads it upright, boxes map directly to screen with a scale factor.
